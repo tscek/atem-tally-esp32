@@ -18,6 +18,10 @@
 #include "mdns.h"
 #include "peers_html.h"
 #include "secrets.h"  // WIFI_SSID/PASS, WIFI2_SSID/PASS, AP_PASS (copy secrets.example.h)
+#include <HTTPClient.h>
+#include <NetworkClientSecure.h>
+#include <Update.h>
+#include "esp_ota_ops.h"
 #include <Preferences.h>
 #include <Wire.h>
 #include <map>
@@ -62,7 +66,8 @@
 #define LED_BRIGHTNESS 80
 #define MAX_BUTTON_CAM 8
 #define MAX_INPUTS     64
-#define FW_VERSION     "2.0"
+#define FW_VERSION     "2.2"
+#define OTA_REPO       "tscek/atem-tally-esp32"  // GitHub releases with manifest.json + .bin per board
 #define DISC_PORT      9911  // UDP broadcast port the lights use to find each other
 #define HOLD_MS        500   // hold = menu / OK
 #define MENU_TIMEOUT_MS 30000 // back to the main screen after 30 s without input
@@ -98,11 +103,17 @@ uint8_t cfgClock = CLOCK_HMS;
 // Known WiFi networks, stored in NVS (n0s/n0p, ...). Seeded with the two built-in ones.
 #define MAX_NETS 6
 String netSsid[MAX_NETS], netPass[MAX_NETS];
+int netRssi[MAX_NETS];    // signal from the last scan, -999 = not seen
+uint32_t renameAt = 0;    // millis() of a rename / network change waiting for its WiFi rejoin
+uint32_t scanWantedAt = 0;  // web page asked for fresh signal values (see webScanLoop)
 int netCount = 0;
 
-enum UiMode { UI_MAIN, UI_MENU, UI_INFO, UI_RESET, UI_IPEDIT, UI_SETUP };
+enum UiMode { UI_MAIN, UI_MENU, UI_INFO, UI_RESET, UI_IPEDIT, UI_SETUP, UI_OTA };
 UiMode uiMode = UI_MAIN;
 enum BtnEvent { B_NONE, B_CLICK, B_DOUBLE, B_HOLD };
+enum OtaJob { OJ_IDLE, OJ_CHECKING, OJ_FOUND, OJ_LATEST, OJ_FAILED, OJ_DOWNLOADING, OJ_DONE };
+enum OtaScreen { OS_CHECKING, OS_OFFER, OS_PROGRESS, OS_MESSAGE };
+volatile OtaJob otaJob = OJ_IDLE;   // written by the OTA task, consumed in otaLoop
 bool apMode = false;
 String cfgName;          // editable name of this light, shown in the shared web list
 
@@ -121,6 +132,9 @@ enum AtemState { A_DISCONNECTED, A_HELLO_SENT, A_CONNECTED };
 AtemState atemState = A_DISCONNECTED;
 uint16_t atemSession = 0;
 uint32_t lastRx = 0, lastHello = 0;
+uint16_t atemNextRx = 1;  // next packet id expected from the ATEM
+uint32_t atemGaps = 0;    // out-of-order packets dropped (the ATEM resends them)
+uint32_t atemConnectedAt = 0;  // for the "tally shown after ... ms" log line
 uint8_t buf[2048];
 
 // ---------------------------------------------------------------- config
@@ -159,10 +173,17 @@ void saveByte(const char *key, uint8_t v) {
 }
 
 // ---------------------------------------------------------------- display + LED
+uint16_t programSource = 0;  // PrgI, mix effect 1
+uint16_t previewSource = 0;  // PrvI, mix effect 1
+
 Tally currentTally() {
-  if (atemState != A_CONNECTED || cfgCam > tallyCount) return T_NONE;
-  uint8_t f = tallyFlags[cfgCam - 1];
-  return (f & 0x01) ? T_PROGRAM : (f & 0x02) ? T_PREVIEW : T_NONE;
+  if (atemState != A_CONNECTED) return T_NONE;
+  if (cfgCam <= tallyCount) {
+    uint8_t f = tallyFlags[cfgCam - 1];
+    return (f & 0x01) ? T_PROGRAM : (f & 0x02) ? T_PREVIEW : T_NONE;
+  }
+  // No TlIn yet (or a camera beyond it): fall back to the M/E 1 program / preview source.
+  return programSource == cfgCam ? T_PROGRAM : previewSource == cfgCam ? T_PREVIEW : T_NONE;
 }
 
 void setLed(Tally t) {
@@ -188,7 +209,6 @@ uint16_t screenBg = COLOR_GREY, screenFg = ST77XX_WHITE;
 int shownSecond = -2, shownBars = -1;
 
 // ---- Switcher-wide state for the bottom line ----
-uint16_t programSource = 0;  // PrgI, mix effect 1
 uint16_t recStatus = 0;      // RTMS: 0 idle, 1 recording, 128 stopping
 uint16_t streamStatus = 1;   // StRS: 1 idle, 2 connecting, 4 streaming, 32 stopping
 std::map<uint16_t, String> shortNames;  // InPr short names of every source (MP1, BLK, ...)
@@ -199,10 +219,23 @@ bool dotOn = false;
 bool isRecording() { return recStatus & 0x01; }
 bool isStreaming() { return streamStatus & 0x04; }
 
+int rssiBars(int rssi) {
+  return rssi > -55 ? 4 : rssi > -65 ? 3 : rssi > -75 ? 2 : rssi > -85 ? 1 : 0;
+}
+
 int wifiBars() {
   if (WiFi.status() != WL_CONNECTED) return 0;
-  int rssi = WiFi.RSSI();
-  return rssi > -55 ? 4 : rssi > -65 ? 3 : rssi > -75 ? 2 : rssi > -85 ? 1 : 0;
+  return rssiBars(WiFi.RSSI());
+}
+
+// "-52 dBm ▂▄▆█" for the web page; missing bars are drawn grey.
+String rssiHtml(int rssi) {
+  if (rssi <= -999) return "ni v dosegu";
+  const char *b[] = {"&#9602;", "&#9604;", "&#9606;", "&#9608;"};
+  String s = String(rssi) + " dBm <span style=letter-spacing:-1px>";
+  int n = rssiBars(rssi);
+  for (int i = 0; i < 4; i++) s += i < n ? String(b[i]) : "<span style=color:#ccc>" + String(b[i]) + "</span>";
+  return s + "</span>";
 }
 
 int clockKey() {
@@ -359,6 +392,7 @@ void redraw() {
     case UI_RESET: drawResetConfirm(); break;
     case UI_IPEDIT: drawIpEdit(); break;
     case UI_SETUP: drawSetup(); break;
+    case UI_OTA:   drawOta(); break;
   }
   setLed(currentTally());
 }
@@ -435,6 +469,10 @@ void atemSendAck(uint16_t ackId) {
   udp.endPacket();
 }
 
+// Set while parsing; atemLoop redraws once after all waiting packets are handled, so a
+// burst (the initial state dump) isn't slowed down by a screen redraw per packet.
+bool atemNeedRedraw = false, atemNeedBottom = false;
+
 void atemParseCommands(const uint8_t *d, int len) {
   bool changed = false, bottomChanged = false;
   int off = 0;
@@ -468,7 +506,13 @@ void atemParseCommands(const uint8_t *d, int len) {
       }
     } else if (memcmp(name, "PrgI", 4) == 0 && dlen >= 4 && data[0] == 0) {  // program, M/E 1
       uint16_t src = (data[2] << 8) | data[3];
+      Tally before = currentTally();
       if (src != programSource) { programSource = src; bottomChanged = true; }
+      if (currentTally() != before) changed = true;
+    } else if (memcmp(name, "PrvI", 4) == 0 && dlen >= 4 && data[0] == 0) {  // preview, M/E 1
+      Tally before = currentTally();
+      previewSource = (data[2] << 8) | data[3];
+      if (currentTally() != before) changed = true;
     } else if (memcmp(name, "RTMS", 4) == 0 && dlen >= 2) {
       // Recording status. Bit 0 = recording, bit 7 = stopping; the other bits are
       // error/media flags (idle with a disk is 0x0002, recording 0x0003).
@@ -501,8 +545,8 @@ void atemParseCommands(const uint8_t *d, int len) {
     }
     off += clen;
   }
-  if (changed) redraw();
-  else if (bottomChanged) drawBottomLine();
+  if (changed) atemNeedRedraw = true;
+  else if (bottomChanged) atemNeedBottom = true;
 }
 
 // Sends one command as a reliable packet (used to ask for recording / streaming
@@ -522,6 +566,7 @@ void atemSendCommand(const char *cmd) {
 void atemDisconnect() {
   atemState = A_DISCONNECTED;
   tallyCount = 0;
+  programSource = previewSource = 0;
   redraw();
 }
 
@@ -548,7 +593,7 @@ void atemLoop() {
     lastRx = now;
 
     if (flags & 0x02) {  // hello answer
-      if (len >= 13 && buf[12] == 0x02) atemSendAck(0);
+      if (len >= 13 && buf[12] == 0x02) { atemSendAck(0); atemNextRx = 1; }
       else Serial.printf("ATEM refused connection (code %d)\n", len >= 13 ? buf[12] : -1);
       continue;
     }
@@ -556,10 +601,29 @@ void atemLoop() {
       atemState = A_CONNECTED;
       atemLocalId = 0;
       Serial.println("ATEM connected");
-      redraw();
+      atemNeedRedraw = true;
+      atemConnectedAt = now;
     }
-    if (flags & 0x01) atemSendAck(remoteId);
-    if (plen > 12 && (flags & 0x01)) atemParseCommands(buf + 12, plen - 12);
+    if (!(flags & 0x01)) continue;  // only reliable packets carry state
+    // Acks are cumulative: acking a packet after a gap tells the ATEM the lost ones
+    // arrived too, so it never resends them (that lost the tally of the initial dump).
+    // Take packets strictly in order; after a gap, drop and let the ATEM resend.
+    if (remoteId == atemNextRx) {
+      atemNextRx = (atemNextRx + 1) & 0x7FFF;
+      atemSendAck(remoteId);
+      if (plen > 12) atemParseCommands(buf + 12, plen - 12);
+    } else if (((atemNextRx - remoteId) & 0x7FFF) < 0x4000) {
+      atemSendAck((atemNextRx - 1) & 0x7FFF);  // already have it (a resend): ack again
+    } else {
+      atemGaps++;
+    }
+  }
+  if (atemNeedRedraw) { atemNeedRedraw = atemNeedBottom = false; redraw(); }
+  else if (atemNeedBottom) { atemNeedBottom = false; drawBottomLine(); }
+  if (atemConnectedAt && (tallyCount || programSource)) {
+    Serial.printf("ATEM tally %d shown %lu ms after connecting (%lu dropped)\n", (int)currentTally(),
+                  millis() - atemConnectedAt, atemGaps);
+    atemConnectedAt = 0;
   }
 }
 
@@ -596,6 +660,12 @@ void redirectHome() {
 // Shared list of all lights (from /api/peers); "Uredi" loads that light's own
 // /api/status and saves through its /api/set, so any light can edit any other.
 
+// Signal of saved network k: live for the connected one, else from the last scan.
+int netLiveRssi(int k) {
+  if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == netSsid[k]) return WiFi.RSSI();
+  return netRssi[k];
+}
+
 void handleRoot() {
   String h = F("<!doctype html><meta name=viewport content='width=device-width'><title>ATEM Tally</title>"
                "<style>body{font-family:sans-serif;max-width:420px;margin:20px auto;padding:0 12px}"
@@ -608,7 +678,8 @@ void handleRoot() {
   h += FPSTR(PEERS_HTML);
   h += "<h3>Ta lucka: " + htmlEscape(cfgName) + " (" + hostName + ".local)</h3>";
   h += "<p>ATEM: " + String(atemState == A_CONNECTED ? "povezan" : "ni povezave");
-  h += "<br>WiFi: " + (WiFi.status() == WL_CONNECTED ? htmlEscape(WiFi.SSID()) + " (" + WiFi.localIP().toString() + ")" : String("ni povezave")) + "</p>";
+  h += "<br>WiFi: " + (WiFi.status() == WL_CONNECTED ? htmlEscape(WiFi.SSID()) + " (" + WiFi.localIP().toString() + ") " + rssiHtml(WiFi.RSSI()) : String("ni povezave")) + "</p>";
+  scanWantedAt = millis();  // fresh signal values for the network list next time
 
   h += "<h3>ATEM</h3><form method=post action=/save>ATEM IP<input name=atem value=\"" + cfgAtem.toString() + "\">";
   h += "Kamera (vhod)<input name=cam type=number min=1 max=" + String(MAX_INPUTS) + " value=" + String(cfgCam) + ">";
@@ -616,14 +687,16 @@ void handleRoot() {
 
   h += "<h3>WiFi omrezja</h3><table>";
   for (int i = 0; i < netCount; i++) {
-    h += "<tr><td>" + htmlEscape(netSsid[i]) + (i == cfgWifi ? " <b>(izbrano)</b>" : "") + "</td><td align=right>";
+    h += "<tr><td>" + htmlEscape(netSsid[i]) + (i == cfgWifi ? " <b>(izbrano)</b>" : "") +
+         "<br><small>" + rssiHtml(netLiveRssi(i)) + "</small></td><td align=right>";
     h += "<form method=post action=/delwifi style=margin:0><input type=hidden name=i value=" + String(i) + ">";
     h += "<button>Izbrisi</button></form></td></tr>";
   }
   h += "</table>";
   if (netCount < MAX_NETS) {
     h += F("<form method=post action=/addwifi>Ime omrezja (SSID)<input name=ssid required>"
-           "Geslo<input name=pass type=password><button>Dodaj in izberi</button></form>");
+           "Geslo<input name=pass type=password><button>Dodaj</button></form>"
+           "<p><small>Omrezje izberes zgoraj pri lucki (Uredi, WiFi).</small></p>");
   }
   server.send(200, "text/html; charset=utf-8", h);
 }
@@ -650,11 +723,9 @@ void handleAddWifi() {
   }
   netSsid[i] = ssid;
   netPass[i] = server.arg("pass");
-  cfgWifi = i;
-  saveNets();
+  netRssi[i] = -999;
+  saveNets();  // only added to the list; choosing it is a separate step
   redirectHome();
-  if (WiFi.SSID() != ssid) wifiReconnect();  // switch to the newly chosen network
-  redraw();
 }
 
 void handleDelWifi() {
@@ -712,7 +783,7 @@ void touchBegin() {
 bool touchDown() {
   static uint32_t lastPoll = 0;
   static bool down = false;
-  if (!cfgTouch) return false;
+  if (!cfgTouch && uiMode != UI_OTA) return false;  // the update offer always takes a tap
   if (millis() - lastPoll < 20) return down;
   lastPoll = millis();
   uint8_t d[2] = {0, 0};
@@ -780,9 +851,9 @@ BtnEvent readButton(bool wantDouble) {
 // Main screen: click = next camera 1..8, hold = open menu.
 // Menu: click = next item, hold = OK (change value / open), double click = back.
 #ifdef BOARD_TOUCH  // no RGB LED on the touch board, but a touch on/off item
-enum MenuItem { M_ROT, M_BRIGHT, M_NUMSIZE, M_INFOSIZE, M_CLOCK, M_WIFI, M_ATEMIP, M_SETUP, M_TOUCH, M_INFO, M_RESET, M_EXIT, M_COUNT, M_LED };
+enum MenuItem { M_ROT, M_BRIGHT, M_NUMSIZE, M_INFOSIZE, M_CLOCK, M_WIFI, M_ATEMIP, M_SETUP, M_TOUCH, M_UPDATE, M_INFO, M_RESET, M_EXIT, M_COUNT, M_LED };
 #else
-enum MenuItem { M_ROT, M_BRIGHT, M_NUMSIZE, M_INFOSIZE, M_CLOCK, M_WIFI, M_ATEMIP, M_SETUP, M_LED, M_INFO, M_RESET, M_EXIT, M_COUNT, M_TOUCH };
+enum MenuItem { M_ROT, M_BRIGHT, M_NUMSIZE, M_INFOSIZE, M_CLOCK, M_WIFI, M_ATEMIP, M_SETUP, M_LED, M_UPDATE, M_INFO, M_RESET, M_EXIT, M_COUNT, M_TOUCH };
 #endif
 int menuSel = 0;
 uint32_t uiActivity = 0;
@@ -801,6 +872,7 @@ String menuLabel(int i) {
     case M_SETUP:  return "Splet, WiFi >";
     case M_LED:    return String("RGB LED: ") + (cfgLed ? "VKLOP" : "IZKLOP");
     case M_TOUCH:  return String("Touch: ") + (cfgTouch ? "VKLOP" : "IZKLOP");
+    case M_UPDATE: return "Preveri posodobitve >";
     case M_INFO:   return "Informacije >";
     case M_RESET:  return "Ponastavi vse >";
     default:       return "Izhod";
@@ -844,8 +916,13 @@ void drawMenu() {
     bool sel = i == menuSel;
     if (sel) tft.fillRoundRect(3, y, W - 6, rowH - 2, 4, ST77XX_WHITE);
     tft.setTextColor(sel ? ST77XX_BLACK : ST77XX_WHITE);
-    tft.setCursor(10, y + 16);
-    tft.print(menuLabel(i));
+    String label = menuLabel(i);
+    int16_t x1, y1; uint16_t w, h;
+    tft.setFont(&FreeSans9pt7b);
+    tft.getTextBounds(label, 0, 0, &x1, &y1, &w, &h);
+    if (w > W - 14) { tft.setFont(); tft.setCursor(10, y + 8); }  // too long (portrait): small font
+    else tft.setCursor(10, y + 16);
+    tft.print(label);
   }
   drawHint("klik=naprej drzi=OK 2x=nazaj");
 }
@@ -1045,6 +1122,7 @@ void menuOk() {
       saveByte("touch", cfgTouch);
       break;
     case M_INFO:  openInfo(); return;
+    case M_UPDATE: otaManualCheck(); return;
     case M_ATEMIP: openIpEdit(); return;
     case M_SETUP: openSetup(); return;
     case M_RESET: uiMode = UI_RESET; drawResetConfirm(); return;
@@ -1054,8 +1132,9 @@ void menuOk() {
 }
 
 void uiLoop() {
-  BtnEvent ev = readButton(uiMode != UI_MAIN);
+  BtnEvent ev = readButton(uiMode != UI_MAIN && uiMode != UI_OTA);
   uint32_t now = millis();
+  if (uiMode == UI_OTA) { otaUiEvent(ev); return; }  // has its own timeouts
   if (ev != B_NONE) uiActivity = now;
   else if (uiMode != UI_MAIN && now - uiActivity > MENU_TIMEOUT_MS) { openMain(); return; }
 
@@ -1116,6 +1195,35 @@ void wifiReconnect() {
   wifiBlindTry = 0;
 }
 
+// Remember the signal of each saved network from a finished scan (n results).
+void storeScan(int n) {
+  for (int k = 0; k < netCount; k++) {
+    netRssi[k] = -999;
+    for (int i = 0; i < n; i++)
+      if (WiFi.SSID(i) == netSsid[k] && WiFi.RSSI(i) > netRssi[k]) netRssi[k] = WiFi.RSSI(i);
+  }
+}
+
+// While connected, scan in the background when the web page asks for the network
+// list (at most every 20 s), so it can show the signal of every saved network.
+bool webScanning = false;
+void webScanLoop() {
+  static uint32_t lastScan = 0;
+  if (WiFi.status() != WL_CONNECTED) { webScanning = false; return; }
+  if (otaJob == OJ_DOWNLOADING) return;  // keep the radio on the download
+  if (webScanning) {
+    int n = WiFi.scanComplete();
+    if (n == WIFI_SCAN_RUNNING && millis() - lastScan < 10000) return;
+    if (n >= 0) storeScan(n);
+    WiFi.scanDelete();
+    webScanning = false;
+  } else if (scanWantedAt && (!lastScan || millis() - lastScan > 20000)) {
+    scanWantedAt = 0;
+    lastScan = millis();
+    webScanning = WiFi.scanNetworks(true) == WIFI_SCAN_RUNNING;
+  }
+}
+
 void wifiLoop() {
   static uint32_t since = 0;
   if (WiFi.status() == WL_CONNECTED || netCount == 0) { wifiSt = W_IDLE; return; }
@@ -1128,6 +1236,7 @@ void wifiLoop() {
   } else if (wifiSt == W_SCANNING) {
     int n = WiFi.scanComplete();
     if (n == WIFI_SCAN_RUNNING) { if (now - since > 10000) { WiFi.scanDelete(); wifiSt = W_IDLE; } return; }
+    storeScan(n);
     int best = -1, bestScore = -100000;
     for (int i = 0; i < n; i++)
       for (int k = 0; k < netCount; k++)
@@ -1232,7 +1341,13 @@ void handleApiStatus() {
 #else
        ",\"touch\":-1" +
 #endif
-       ",\"board\":\"" BOARD_NAME "\"}";
+       ",\"board\":\"" BOARD_NAME "\"";
+  // Saved networks with their signal (-999 = not seen in the last scan), "wifi" = chosen one.
+  s += ",\"wifi\":" + String(cfgWifi) + ",\"scanning\":" + (webScanning ? "true" : "false") + ",\"nets\":[";
+  for (int k = 0; k < netCount; k++)
+    s += String(k ? "," : "") + "{\"ssid\":\"" + jsonEsc(netSsid[k]) + "\",\"rssi\":" + netLiveRssi(k) + "}";
+  s += "]}";
+  scanWantedAt = millis();
   sendJson(s);
 }
 
@@ -1252,7 +1367,7 @@ void handleApiOptions() {
   server.send(204);
 }
 
-// POST /api/set with any of: name, cam, atem, bright (0..3), rot (0..3), led (0/1)
+// POST /api/set with any of: name, cam, atem, bright (0..3), rot (0..3), led (0/1), touch (0/1), wifi (index)
 void handleApiSet() {
   if (server.hasArg("name")) {
     String n = server.arg("name");
@@ -1263,6 +1378,14 @@ void handleApiSet() {
   if (server.hasArg("bright")) { cfgBright = server.arg("bright").toInt() & 3; saveByte("bright", cfgBright); }
   if (server.hasArg("led")) { cfgLed = server.arg("led").toInt() != 0; saveByte("led", cfgLed); }
   if (server.hasArg("touch")) { cfgTouch = server.arg("touch").toInt() != 0; saveByte("touch", cfgTouch); }
+  if (server.hasArg("wifi")) {  // index into this light's saved networks
+    int k = server.arg("wifi").toInt();
+    if (k >= 0 && k < netCount && k != cfgWifi) {
+      cfgWifi = k;
+      saveByte("wifi", cfgWifi);
+      if (WiFi.SSID() != netSsid[k]) renameAt = millis();  // rejoin after the reply is sent
+    }
+  }
   if (server.hasArg("rot")) {
     cfgRot = server.arg("rot").toInt() & 3;
     saveByte("rot", cfgRot);
@@ -1276,7 +1399,8 @@ void handleApiSet() {
   handleApiStatus();
 }
 
-// Serial console (115200): "wifi <ssid>" selects a known network, "status" prints state.
+// Serial console (115200): "wifi <ssid>" selects a known network, "status" prints state,
+// "ota" checks for an update (like the menu item), "reboot" restarts.
 void serialLoop() {
   static String line;
   while (Serial.available()) {
@@ -1293,10 +1417,16 @@ void serialLoop() {
         wifiReconnect();
         Serial.printf("WiFi: switching to %s\n", ssid.c_str());
       } else Serial.println("WiFi: unknown network");
+    } else if (line == "reboot") {
+      ESP.restart();
+    } else if (line == "ota") {
+      otaManualCheck();
     } else if (line == "status") {
       Serial.printf("name %s, WiFi %s %s, ATEM %s %s, peers %d\n", cfgName.c_str(), WiFi.SSID().c_str(),
                     WiFi.localIP().toString().c_str(), cfgAtem.toString().c_str(),
                     atemState == A_CONNECTED ? "connected" : "not connected", peerCount);
+      Serial.printf("cam %d tally %d (TlIn %d inputs), PGM %d PVW %d, dropped %lu, FW " FW_VERSION "\n", cfgCam,
+                    (int)currentTally(), tallyCount, programSource, previewSource, atemGaps);
     }
     line = "";
   }
@@ -1334,7 +1464,6 @@ String makeHostName(const String &name) {
 }
 
 bool aliasOwned = false;  // this light answers the shared name tally.local
-uint32_t renameAt = 0;    // millis() of a rename waiting for its WiFi rejoin
 
 void startMdns() {
   MDNS.end();
@@ -1390,11 +1519,321 @@ void aliasLoop() {
   }
 }
 
+// ---------------------------------------------------------------- OTA from GitHub
+// After boot and every 12 h (or from the menu) the light reads manifest.json of the
+// latest GitHub release over HTTPS (CA bundle built into the core). A newer version is
+// offered on screen for 5 s, never while on PROGRAM: click / tap installs it, no answer
+// cancels. The image is checked against the manifest MD5 before it becomes the boot
+// image, and the new firmware must reach WiFi within 3 min or the bootloader goes back
+// to the old one (app rollback).
+#define OTA_MANIFEST_URL "https://github.com/" OTA_REPO "/releases/latest/download/manifest.json"
+#define OTA_FIRST_MS  20000UL               // first check this long after WiFi is up
+#define OTA_EVERY_MS  (12UL * 3600 * 1000)
+#define OTA_OFFER_S   5
+
+volatile int otaPercent = 0;
+String otaVersion, otaUrl, otaMd5, otaError;
+bool otaManual = false;   // check started from the menu: show the result
+bool otaOffer = false;    // a newer version waits to be offered
+OtaScreen otaScreen = OS_MESSAGE;
+String otaMsg[3];
+uint32_t otaScreenAt = 0;
+int otaShown = -1;        // countdown second / percent currently drawn
+
+// "2.10" > "2.9": compares the dot-separated numbers.
+int versionCmp(const String &a, const String &b) {
+  int i = 0, j = 0, na = a.length(), nb = b.length();
+  while (i < na || j < nb) {
+    long x = 0, y = 0;
+    while (i < na && isdigit((uint8_t)a[i])) x = x * 10 + (a[i++] - '0');
+    while (j < nb && isdigit((uint8_t)b[j])) y = y * 10 + (b[j++] - '0');
+    if (x != y) return x < y ? -1 : 1;
+    while (i < na && !isdigit((uint8_t)a[i])) i++;
+    while (j < nb && !isdigit((uint8_t)b[j])) j++;
+  }
+  return 0;
+}
+
+// String or number value of "key" in the manifest, searching from position from.
+String jsonValue(const String &js, const String &key, int from = 0) {
+  int k = js.indexOf("\"" + key + "\"", from);
+  if (k < 0) return "";
+  int s = js.indexOf(':', k + key.length() + 2);
+  if (s < 0) return "";
+  s++;
+  while (s < (int)js.length() && isspace((uint8_t)js[s])) s++;
+  if (s < (int)js.length() && js[s] == '"') {
+    int e = js.indexOf('"', s + 1);
+    return e < 0 ? "" : js.substring(s + 1, e);
+  }
+  int e = s;
+  while (e < (int)js.length() && (isalnum((uint8_t)js[e]) || js[e] == '.' || js[e] == '-')) e++;
+  return js.substring(s, e);
+}
+
+// GET over HTTPS, following GitHub's redirects to its download host.
+bool otaGet(HTTPClient &http, NetworkClientSecure &client, const String &url) {
+  client.useBuiltinCACertBundle();
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setTimeout(15000);
+  http.setUserAgent("atem-tally/" FW_VERSION);
+  if (!http.begin(client, url)) { otaError = "napacen URL"; return false; }
+  int code = http.GET();
+  if (code == 200) return true;
+  otaError = code < 0 ? HTTPClient::errorToString(code) : "HTTP " + String(code);
+  http.end();
+  return false;
+}
+
+OtaJob otaCheck() {
+  NetworkClientSecure client;
+  HTTPClient http;
+  if (!otaGet(http, client, OTA_MANIFEST_URL)) return OJ_FAILED;
+  String js = http.getString();
+  http.end();
+  String v = jsonValue(js, "version");
+  int b = js.indexOf("\"" BOARD_NAME "\"");
+  if (!v.length() || b < 0) { otaError = "napacen manifest"; return OJ_FAILED; }
+  Serial.printf("OTA: latest %s, running " FW_VERSION "\n", v.c_str());
+  if (versionCmp(v, FW_VERSION) <= 0) return OJ_LATEST;
+  otaVersion = v;
+  otaUrl = jsonValue(js, "url", b);
+  otaMd5 = jsonValue(js, "md5", b);
+  if (!otaUrl.startsWith("https://")) { otaError = "ni datoteke za to plosco"; return OJ_FAILED; }
+  return OJ_FOUND;
+}
+
+OtaJob otaDownload() {
+  NetworkClientSecure client;
+  HTTPClient http;
+  if (!otaGet(http, client, otaUrl)) return OJ_FAILED;
+  int total = http.getSize();
+  if (total <= 0 || !Update.begin(total)) {
+    otaError = total <= 0 ? "neznana velikost" : "premalo prostora";
+    http.end();
+    return OJ_FAILED;
+  }
+  if (otaMd5.length() == 32) Update.setMD5(otaMd5.c_str());
+  NetworkClient *s = http.getStreamPtr();
+  static uint8_t chunk[2048];
+  int done = 0;
+  uint32_t lastData = millis();
+  while (done < total && millis() - lastData < 15000) {
+    int n = s->available();
+    if (n <= 0) { delay(5); continue; }
+    n = s->read(chunk, min(n, (int)sizeof(chunk)));
+    if (n <= 0) continue;
+    if (Update.write(chunk, n) != (size_t)n) break;
+    done += n;
+    lastData = millis();
+    otaPercent = (int)(100LL * done / total);
+  }
+  http.end();
+  if (done < total) {
+    otaError = Update.hasError() ? Update.errorString() : "prenos prekinjen";
+    Update.abort();
+    return OJ_FAILED;
+  }
+  if (!Update.end()) { otaError = Update.errorString(); return OJ_FAILED; }  // MD5 / image check
+  return OJ_DONE;
+}
+
+// Runs the check or download in its own task so the screen and ATEM keep working.
+void otaTask(void *download) {
+  otaJob = download ? otaDownload() : otaCheck();
+  vTaskDelete(NULL);
+}
+
+void otaStart(bool download) {
+  otaError = "";
+  otaPercent = 0;
+  otaJob = download ? OJ_DOWNLOADING : OJ_CHECKING;
+  if (xTaskCreate(otaTask, "ota", 12288, download ? (void *)1 : nullptr, 1, nullptr) != pdPASS) {
+    otaError = "ni pomnilnika";
+    otaJob = OJ_FAILED;
+  }
+}
+
+void openOta(OtaScreen sc) {
+  uiMode = UI_OTA;
+  otaScreen = sc;
+  otaScreenAt = millis();
+  drawOta();
+}
+
+void otaMessage(const String &a, const String &b, const String &c) {
+  otaMsg[0] = a; otaMsg[1] = b; otaMsg[2] = c;
+  openOta(OS_MESSAGE);
+}
+
+void drawOta() {
+  int W = tft.width(), H = tft.height();
+  String l[3];
+  const char *hint = "";
+  switch (otaScreen) {
+    case OS_CHECKING: l[0] = "Preverjam GitHub ..."; l[1] = "zdaj FW " FW_VERSION; hint = "klik = nazaj"; break;
+    case OS_OFFER:    l[0] = "Nova FW " + otaVersion; l[1] = "zdaj FW " FW_VERSION; l[2] = "Klik = posodobi"; hint = "brez odziva = preklic"; break;
+    case OS_PROGRESS: l[0] = "Nalagam FW " + otaVersion; l[1] = "Ne izklapljaj!"; break;
+    case OS_MESSAGE:  for (int i = 0; i < 3; i++) l[i] = otaMsg[i]; hint = "klik = nazaj"; break;
+  }
+  tft.fillScreen(COLOR_MENU);
+  drawTitle("POSODOBITEV");
+  int lineH = H > W ? 30 : 22;
+  for (int i = 0; i < 3; i++) {
+    int16_t x1, y1; uint16_t w, h;
+    tft.setFont(&FreeSans9pt7b);
+    tft.getTextBounds(l[i], 0, 0, &x1, &y1, &w, &h);
+    tft.setTextColor(i == 2 && otaScreen == OS_OFFER ? ST77XX_YELLOW : ST77XX_WHITE);
+    if (w > W - 8) { tft.setFont(); tft.setCursor(6, STATUS_H + 8 + i * lineH); }
+    else tft.setCursor(6, STATUS_H + 18 + i * lineH);
+    tft.print(l[i]);
+  }
+  drawHint(hint);
+  otaShown = -1;
+  otaDrawDynamic();
+}
+
+// Countdown number (offer) or progress bar (download) under the text.
+void otaDrawDynamic() {
+  int W = tft.width(), H = tft.height(), y = H - BOTTOM_H - 40;
+  if (otaScreen == OS_OFFER) {
+    int left = max(0, OTA_OFFER_S - (int)((millis() - otaScreenAt) / 1000));
+    if (left == otaShown) return;
+    otaShown = left;
+    tft.fillRect(0, y - 4, W, 42, COLOR_MENU);
+    tft.setFont(&FreeSansBold24pt7b);
+    tft.setTextSize(1);
+    tft.setTextColor(ST77XX_WHITE);
+    int16_t x1, y1; uint16_t w, h;
+    tft.getTextBounds(String(left), 0, 0, &x1, &y1, &w, &h);
+    tft.setCursor((W - w) / 2 - x1, y + 36);
+    tft.print(left);
+  } else if (otaScreen == OS_PROGRESS) {
+    int p = otaPercent;
+    if (p == otaShown) return;
+    otaShown = p;
+    int bw = W - 16;
+    tft.drawRect(8, y, bw, 18, ST77XX_WHITE);
+    tft.fillRect(10, y + 2, (bw - 4) * p / 100, 14, COLOR_GREEN);
+    tft.fillRect(0, y + 22, W, 16, COLOR_MENU);
+    tft.setFont();
+    tft.setTextSize(2);
+    tft.setTextColor(ST77XX_WHITE);
+    String t = String(p) + " %";
+    tft.setCursor((W - t.length() * 12) / 2, y + 22);
+    tft.print(t);
+    tft.setTextSize(1);
+  }
+}
+
+void otaUiEvent(BtnEvent ev) {
+  uint32_t age = millis() - otaScreenAt;
+  switch (otaScreen) {
+    case OS_CHECKING:  // the check goes on in the background; otaLoop shows its result
+      if (ev != B_NONE) { otaManual = false; openMain(); }
+      break;
+    case OS_OFFER:
+      if (ev != B_NONE) {
+        otaOffer = false;
+        Serial.printf("OTA: installing %s\n", otaVersion.c_str());
+        otaStart(true);
+        openOta(OS_PROGRESS);
+      } else if (age >= OTA_OFFER_S * 1000UL) {
+        otaOffer = false;
+        Serial.println("OTA: offer not answered, cancelled");
+        openMain();
+      } else otaDrawDynamic();
+      break;
+    case OS_PROGRESS:
+      otaDrawDynamic();
+      break;
+    case OS_MESSAGE:
+      if (ev != B_NONE || age > 5000) openMain();
+      break;
+  }
+}
+
+void otaManualCheck() {
+  otaManual = true;
+  if (otaOffer) {
+    if (currentTally() == T_PROGRAM) otaMessage("Na voljo FW " + otaVersion, "ponudim jo, ko lucka", "ni na PROGRAM");
+    else openOta(OS_OFFER);
+  } else if (WiFi.status() != WL_CONNECTED) {
+    otaMessage("Ni WiFi povezave", "", "");
+  } else {
+    if (otaJob == OJ_IDLE) otaStart(false);
+    openOta(OS_CHECKING);
+  }
+}
+
+void otaLoop() {
+  static uint32_t nextCheck = 0;
+  if (WiFi.status() == WL_CONNECTED && !nextCheck) nextCheck = millis() + OTA_FIRST_MS;
+  if (nextCheck && (int32_t)(millis() - nextCheck) >= 0 && otaJob == OJ_IDLE && WiFi.status() == WL_CONNECTED) {
+    nextCheck = millis() + OTA_EVERY_MS;
+    otaManual = uiMode == UI_OTA && otaScreen == OS_CHECKING;
+    otaStart(false);
+  }
+  bool shown = uiMode == UI_OTA;
+  switch (otaJob) {
+    case OJ_FOUND:
+      otaJob = OJ_IDLE;
+      otaOffer = true;
+      Serial.printf("OTA: FW %s available\n", otaVersion.c_str());
+      if (otaManual && currentTally() == T_PROGRAM) otaMessage("Na voljo FW " + otaVersion, "ponudim jo, ko lucka", "ni na PROGRAM");
+      break;
+    case OJ_LATEST:
+      otaJob = OJ_IDLE;
+      if (otaManual && shown) otaMessage("FW " FW_VERSION " je", "najnovejsa.", "");
+      break;
+    case OJ_FAILED:
+      otaJob = OJ_IDLE;
+      Serial.printf("OTA: failed: %s\n", otaError.c_str());
+      if ((otaManual || otaScreen == OS_PROGRESS) && shown) otaMessage("Napaka: " + otaError, "ostaja FW " FW_VERSION, "");
+      break;
+    case OJ_DONE:
+      Serial.printf("OTA: FW %s written, restarting\n", otaVersion.c_str());
+      otaMessage("Posodobljeno na FW " + otaVersion, "ponovni zagon ...", "");
+      delay(1500);
+      ESP.restart();
+      break;
+    default: break;
+  }
+  bool program = currentTally() == T_PROGRAM;
+  if (otaOffer && !program && (uiMode == UI_MAIN || (shown && otaScreen == OS_CHECKING))) openOta(OS_OFFER);
+  if (shown && otaScreen == OS_OFFER && program) openMain();  // went on air: offer again afterwards
+}
+
+// The bootloader keeps a freshly installed image on probation: keep it once it has
+// WiFi, go back to the previous one if it can't get there in 3 minutes.
+extern "C" bool verifyRollbackLater() { return true; }
+
+void otaHealthLoop() {
+  static int8_t pending = -1;
+  if (pending == 0) return;
+  if (pending < 0) {
+    esp_ota_img_states_t st;
+    pending = esp_ota_get_state_partition(esp_ota_get_running_partition(), &st) == ESP_OK &&
+              st == ESP_OTA_IMG_PENDING_VERIFY;
+    if (pending) Serial.println("OTA: new firmware on probation until WiFi connects");
+    return;
+  }
+  if (WiFi.status() == WL_CONNECTED && millis() > 15000) {
+    esp_ota_mark_app_valid_cancel_rollback();
+    pending = 0;
+    Serial.println("OTA: FW " FW_VERSION " confirmed");
+  } else if (millis() > 180000) {
+    Serial.println("OTA: no WiFi with the new firmware, rolling back");
+    esp_ota_mark_app_invalid_rollback_and_reboot();
+  }
+}
+
 // ---------------------------------------------------------------- main
 void setup() {
   Serial.begin(115200);
   pinMode(PIN_BOOT, INPUT_PULLUP);
   loadConfig();
+  for (int k = 0; k < MAX_NETS; k++) netRssi[k] = -999;
   ledcAttach(PIN_BL, 5000, 8);
   ledcWrite(PIN_BL, brightnessDuty());
   SPI.begin(PIN_SCLK, -1, PIN_MOSI, PIN_CS);
@@ -1456,8 +1895,11 @@ void loop() {
   blinkLoop();
   backlightLoop();
   discoveryLoop();
+  webScanLoop();
   aliasLoop();
   renameLoop();
+  otaLoop();
+  otaHealthLoop();
   serialLoop();
   delay(2);
 }

@@ -14,10 +14,12 @@ Lučka se z ATEM-om pogovarja neposredno po UDP protokolu (vrata 9910), brez ra�
 - Osvetlitev zaslona utripa, ko WiFi ali ATEM nista povezana.
 - RGB LED na plošči sledi tally stanju (lahko izklopiš).
 - Spletna stran na `http://<IP lučke>/` ali `http://tally.local`: ATEM IP, kamera, svetlost,
-  rotacija, ime lučke, seznam WiFi omrežij (do 6).
+  rotacija, ime lučke, WiFi omrežje z močjo signala. Dodano omrežje se samo shrani
+  (do 6), izbereš ga pri lučki (Uredi, WiFi).
 - Več lučk se samo najde (UDP broadcast, vrata 9911); na strani katerekoli lučke urejaš vse.
   Vsaka ima tudi svoje omrežno ime, narejeno iz imena lučke: "Tally lučka 1" postane
   `tally-lucka-1` (tako jo vidi usmerjevalnik) in `http://tally-lucka-1.local`.
+- Posodobitve prek WiFi (OTA) iz GitHub Release; glej spodaj.
 - Če WiFi 30 s ni dosegljiv, se odpre dostopna točka `ATEM-Tally-XXXX`
   (geslo `AP_PASS`), stran na `http://192.168.4.1`.
 
@@ -33,7 +35,7 @@ V meniju:
 - **dvoklik** = nazaj
 
 Meni: rotacija, svetlost, WiFi omrežje, ATEM IP, RGB LED, velikost številke, ura,
-splet/WiFi (vklopi AP), info, ponastavitev.
+splet/WiFi (vklopi AP), preveri posodobitve, info, ponastavitev.
 
 ## Strojna oprema
 
@@ -55,8 +57,8 @@ Ko je vklopljena, dotik zaslona deluje enako kot tipka BOOT (dotik = klik, drži
    `--build-property "compiler.cpp.extra_flags=-DBOARD_TOUCH"` k ukazu compile.
 
 ```
-arduino-cli compile --fqbn esp32:esp32:esp32c6:CDCOnBoot=cdc,PartitionScheme=huge_app AtemTally
-arduino-cli upload  --fqbn esp32:esp32:esp32c6:CDCOnBoot=cdc,PartitionScheme=huge_app -p COM7 AtemTally
+arduino-cli compile --fqbn esp32:esp32:esp32c6:CDCOnBoot=cdc,PartitionScheme=min_spiffs AtemTally
+arduino-cli upload  --fqbn esp32:esp32:esp32c6:CDCOnBoot=cdc,PartitionScheme=min_spiffs -p COM7 AtemTally
 ```
 
 Nastavitve se shranijo v NVS in ostanejo po ponovnem nalaganju.
@@ -65,3 +67,21 @@ Nastavitve se shranijo v NVS in ostanejo po ponovnem nalaganju.
 
 - `status` izpiše WiFi, IP, ATEM in število najdenih lučk.
 - `wifi <ime>` preklopi na znano omrežje.
+- `ota` preveri posodobitve (kot postavka v meniju), `reboot` ponovno zažene lučko.
+
+## Posodobitve (OTA)
+
+Lučka po zagonu (po 20 s z WiFi) in nato vsakih 12 ur prebere `manifest.json` zadnje
+izdaje na GitHubu (HTTPS). Ročno: meni **Preveri posodobitve**.
+- Ko je na voljo novejša verzija, se na zaslonu 5 s odšteva ponudba: **klik ali dotik**
+  namesti posodobitev, brez odziva se prekliče (ponovno čez 12 ur ali ročno).
+- Ponudbe ni, dokler je lučka na **PROGRAM**; pokaže se, ko gre s programa.
+- Med prenosom je na zaslonu napredek. Slika se pred zamenjavo preveri (MD5 iz manifesta).
+- Nova verzija mora v 3 minutah dobiti WiFi, sicer se lučka vrne na prejšnjo (rollback).
+
+OTA potrebuje particijsko shemo `min_spiffs` (dve reži po 1,9 MB). Lučko, ki ima še
+`huge_app` (FW 2.1 ali starejša), je treba enkrat naložiti prek USB.
+
+Nova izdaja: povečaj `FW_VERSION` v `AtemTally.ino`, nato `./release.sh` (Git Bash).
+Skripta prevede obe plošči in objavi GitHub Release `v<verzija>` z
+`AtemTally-<plošča>.bin` in `manifest.json`. Repozitorij mora biti javen.

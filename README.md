@@ -1,7 +1,8 @@
 # ATEM tally lučka (ESP32-C6)
 
 Tally lučka za Blackmagic ATEM (preizkušeno z ATEM Mini Extreme) na plošči
-**Waveshare ESP32-C6-LCD-1.47** (zaslon ST7789 172×320, RGB LED WS2812).
+**Waveshare ESP32-C6-LCD-1.47** (zaslon ST7789 172×320, RGB LED WS2812) ali
+**Waveshare ESP32-C6-Touch-LCD-1.47** (zaslon JD9853, touch AXS5106L, brez RGB LED).
 Lučka se z ATEM-om pogovarja neposredno po UDP protokolu (vrata 9910), brez računalnika.
 
 ## Funkcije
@@ -36,16 +37,22 @@ splet/WiFi (vklopi AP), info, ponastavitev.
 
 ## Strojna oprema
 
-Samo plošča Waveshare ESP32-C6-LCD-1.47, brez dodatnega ožičenja. Napajanje prek USB-C.
-Uporabljeni pini: zaslon MOSI 6, SCLK 7, CS 14, DC 15, RST 21, osvetlitev 22;
-RGB LED 8; tipka BOOT 9.
+Samo plošča, brez dodatnega ožičenja. Napajanje prek USB-C.
+- **ESP32-C6-LCD-1.47:** zaslon MOSI 6, SCLK 7, CS 14, DC 15, RST 21, osvetlitev 22;
+  RGB LED 8; tipka BOOT 9.
+- **ESP32-C6-Touch-LCD-1.47:** zaslon MOSI 2, SCLK 1, CS 14, DC 15, RST 22, osvetlitev 23;
+  touch I2C SDA 18, SCL 19, RST 20 (naslov 0x63); tipka BOOT 9.
+
+Na touch plošči je v meniju in na spletni strani nastavitev **Touch** (privzeto izklopljena).
+Ko je vklopljena, dotik zaslona deluje enako kot tipka BOOT (dotik = klik, drži = meni).
 
 ## Prevajanje in nalaganje
 
 1. Kopiraj `secrets.example.h` v `secrets.h` in vpiši svoja WiFi omrežja in geslo AP.
 2. Namesti [arduino-cli](https://arduino.github.io/arduino-cli/), ESP32 jedro (3.3.x)
    in knjižnici *Adafruit GFX* ter *Adafruit ST7735 and ST7789*.
-3. Prevedi in naloži (zamenjaj COM vrata):
+3. Prevedi in naloži (zamenjaj COM vrata). Za touch ploščo dodaj
+   `--build-property "compiler.cpp.extra_flags=-DBOARD_TOUCH"` k ukazu compile.
 
 ```
 arduino-cli compile --fqbn esp32:esp32:esp32c6:CDCOnBoot=cdc,PartitionScheme=huge_app AtemTally

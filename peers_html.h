@@ -30,7 +30,8 @@ async function edit(ip){
    `ATEM IP<input name=atem value="${esc(s.atemIp)}">`+
    `Svetlost<select name=bright>${opt(s.bright,['25 %','50 %','75 %','100 %'])}</select>`+
    `Zasuk<select name=rot>${opt(s.rot,['0','90','180','270'])}</select>`+
-   `RGB LED<select name=led>${opt(s.led,['izklop','vklop'])}</select>`+
+   (s.led>=0?`RGB LED<select name=led>${opt(s.led,['izklop','vklop'])}</select>`:'')+
+   (s.touch>=0?`Touch<select name=touch>${opt(s.touch,['izklop','vklop'])}</select>`:'')+
    `<button>Shrani</button> <button type=button onclick="edit('')">Zapri</button></form></div>`;
   document.getElementById('f').onsubmit=async ev=>{
    ev.preventDefault();

@@ -19,6 +19,7 @@
 #include "peers_html.h"
 #include "secrets.h"  // WIFI_SSID/PASS, WIFI2_SSID/PASS, AP_PASS (copy secrets.example.h)
 #include <Preferences.h>
+#include <Wire.h>
 #include <map>
 #include <SPI.h>
 #include <Adafruit_GFX.h>
@@ -28,7 +29,24 @@
 #include <Fonts/FreeSans12pt7b.h>
 #include <Fonts/FreeSans18pt7b.h>
 
-// ---- Board pins (Waveshare wiki) ----
+// ---- Board pins (Waveshare wiki / demo code) ----
+// Default: ESP32-C6-LCD-1.47 (ST7789, RGB LED). Build with -DBOARD_TOUCH for the
+// ESP32-C6-Touch-LCD-1.47 (JD9853 display, AXS5106L touch, no RGB LED).
+#ifdef BOARD_TOUCH
+#define PIN_MOSI 2
+#define PIN_SCLK 1
+#define PIN_CS   14
+#define PIN_DC   15
+#define PIN_RST  22
+#define PIN_BL   23
+#define PIN_LED  -1
+#define PIN_BOOT 9
+#define PIN_TP_SDA 18
+#define PIN_TP_SCL 19
+#define PIN_TP_RST 20
+#define TP_ADDR    0x63
+#define BOARD_NAME "ESP32-C6-Touch-LCD-1.47"
+#else
 #define PIN_MOSI 6
 #define PIN_SCLK 7
 #define PIN_CS   14
@@ -37,12 +55,14 @@
 #define PIN_BL   22
 #define PIN_LED  8
 #define PIN_BOOT 9
+#define BOARD_NAME "ESP32-C6-LCD-1.47"
+#endif
 
 #define ATEM_PORT      9910
 #define LED_BRIGHTNESS 80
 #define MAX_BUTTON_CAM 8
 #define MAX_INPUTS     64
-#define FW_VERSION     "1.9"
+#define FW_VERSION     "2.0"
 #define DISC_PORT      9911  // UDP broadcast port the lights use to find each other
 #define HOLD_MS        500   // hold = menu / OK
 #define MENU_TIMEOUT_MS 30000 // back to the main screen after 30 s without input
@@ -69,6 +89,7 @@ uint8_t cfgRot = 1;  // 0..3, 1 = landscape
 uint8_t cfgBright = 3;  // 0..3 = 25/50/75/100 %
 uint8_t cfgWifi = 0;    // preferred network, index into knownNets
 bool cfgLed = true;      // RGB LED shows tally
+bool cfgTouch = false;   // touch screen acts as the button (touch board only)
 uint8_t cfgNumSize = 1;  // camera number size 0..2 (small/medium/large)
 uint8_t cfgInfoSize = 0; // clock, name and bottom line size 0..2
 enum ClockMode { CLOCK_OFF, CLOCK_HM, CLOCK_HMS };
@@ -122,6 +143,7 @@ void loadConfig() {
   }
   cfgWifi = netCount ? prefs.getUChar("wifi", 0) % netCount : 0;
   cfgLed = prefs.getUChar("led", 1);
+  cfgTouch = prefs.getUChar("touch", 0);
   cfgNumSize = prefs.getUChar("numsize", 1) % 3;
   cfgInfoSize = prefs.getUChar("infosize", 0) % 3;
   cfgClock = prefs.getUChar("clock", CLOCK_HMS) % 3;
@@ -144,6 +166,7 @@ Tally currentTally() {
 }
 
 void setLed(Tally t) {
+  if (PIN_LED < 0) return;
   if (!cfgLed) t = T_NONE;
   switch (t) {
     // This board's LED has red and green swapped compared to rgbLedWrite's GRB order.
@@ -675,6 +698,61 @@ void backlightLoop() {
   ledcWrite(PIN_BL, duty);
 }
 
+// ---------------------------------------------------------------- touch
+// AXS5106L on I2C: register 0x01 holds the number of touch points in the low nibble
+// of the second byte. Only "is it touched" is used, so the screen works as one big button.
+#ifdef BOARD_TOUCH
+void touchBegin() {
+  pinMode(PIN_TP_RST, OUTPUT);
+  digitalWrite(PIN_TP_RST, LOW);  delay(10);
+  digitalWrite(PIN_TP_RST, HIGH); delay(10);
+  Wire.begin(PIN_TP_SDA, PIN_TP_SCL, 400000);
+}
+
+bool touchDown() {
+  static uint32_t lastPoll = 0;
+  static bool down = false;
+  if (!cfgTouch) return false;
+  if (millis() - lastPoll < 20) return down;
+  lastPoll = millis();
+  uint8_t d[2] = {0, 0};
+  Wire.beginTransmission(TP_ADDR);
+  Wire.write(0x01);
+  if (Wire.endTransmission() == 0 && Wire.requestFrom(TP_ADDR, 2) == 2) { d[0] = Wire.read(); d[1] = Wire.read(); }
+  down = (d[1] & 0x0F) != 0;
+  return down;
+}
+#else
+void touchBegin() {}
+bool touchDown() { return false; }
+#endif
+
+// The JD9853 understands the ST7789 commands Adafruit_ST7789 sends, but needs its own
+// panel settings on top (from Waveshare's esp_lcd_jd9853 driver).
+void panelInit() {
+#ifdef BOARD_TOUCH
+  struct Cmd { uint8_t cmd, len; uint8_t data[32]; };
+  static const Cmd cmds[] = {
+    {0xDF, 2, {0x98, 0x53}}, {0xDF, 2, {0x98, 0x53}}, {0xB2, 1, {0x23}},
+    {0xB7, 4, {0x00, 0x47, 0x00, 0x6F}},
+    {0xBB, 6, {0x1C, 0x1A, 0x55, 0x73, 0x63, 0xF0}},
+    {0xC0, 2, {0x44, 0xA4}}, {0xC1, 1, {0x16}},
+    {0xC3, 8, {0x7D, 0x07, 0x14, 0x06, 0xCF, 0x71, 0x72, 0x77}},
+    {0xC4, 12, {0x00, 0x00, 0xA0, 0x79, 0x0B, 0x0A, 0x16, 0x79, 0x0B, 0x0A, 0x16, 0x82}},
+    {0xC8, 32, {0x3F, 0x32, 0x29, 0x29, 0x27, 0x2B, 0x27, 0x28, 0x28, 0x26, 0x25, 0x17, 0x12, 0x0D, 0x04, 0x00,
+                0x3F, 0x32, 0x29, 0x29, 0x27, 0x2B, 0x27, 0x28, 0x28, 0x26, 0x25, 0x17, 0x12, 0x0D, 0x04, 0x00}},
+    {0xD0, 5, {0x04, 0x06, 0x6B, 0x0F, 0x00}}, {0xD7, 2, {0x00, 0x30}}, {0xE6, 1, {0x14}},
+    {0xDE, 1, {0x01}}, {0xB7, 5, {0x03, 0x13, 0xEF, 0x35, 0x35}}, {0xC1, 3, {0x14, 0x15, 0xC0}},
+    {0xC2, 2, {0x06, 0x3A}}, {0xC4, 2, {0x72, 0x12}}, {0xBE, 1, {0x00}}, {0xDE, 1, {0x02}},
+    {0xE5, 3, {0x00, 0x02, 0x00}}, {0xE5, 3, {0x01, 0x02, 0x00}}, {0xDE, 1, {0x00}},
+    {0x35, 1, {0x00}}, {0x3A, 1, {0x05}},
+    {0xDE, 1, {0x02}}, {0xE5, 3, {0x00, 0x02, 0x00}}, {0xDE, 1, {0x00}},
+  };
+  for (const Cmd &c : cmds) tft.sendCommand(c.cmd, c.data, c.len);
+  tft.invertDisplay(true);
+#endif
+}
+
 // ---------------------------------------------------------------- button
 // Turns the raw BOOT button into click / double click / hold events. Double
 // clicks are only detected when asked for (in the menu), so a click on the main
@@ -683,7 +761,7 @@ BtnEvent readButton(bool wantDouble) {
   static uint32_t downAt = 0, clickAt = 0;
   static bool wasDown = false, held = false, pending = false;
   uint32_t now = millis();
-  bool down = digitalRead(PIN_BOOT) == LOW;
+  bool down = digitalRead(PIN_BOOT) == LOW || touchDown();  // a touch acts like the button
   BtnEvent ev = B_NONE;
 
   if (down && !wasDown) { downAt = now; held = false; }
@@ -701,7 +779,11 @@ BtnEvent readButton(bool wantDouble) {
 // ---------------------------------------------------------------- menu
 // Main screen: click = next camera 1..8, hold = open menu.
 // Menu: click = next item, hold = OK (change value / open), double click = back.
-enum MenuItem { M_ROT, M_BRIGHT, M_NUMSIZE, M_INFOSIZE, M_CLOCK, M_WIFI, M_ATEMIP, M_SETUP, M_LED, M_INFO, M_RESET, M_EXIT, M_COUNT };
+#ifdef BOARD_TOUCH  // no RGB LED on the touch board, but a touch on/off item
+enum MenuItem { M_ROT, M_BRIGHT, M_NUMSIZE, M_INFOSIZE, M_CLOCK, M_WIFI, M_ATEMIP, M_SETUP, M_TOUCH, M_INFO, M_RESET, M_EXIT, M_COUNT, M_LED };
+#else
+enum MenuItem { M_ROT, M_BRIGHT, M_NUMSIZE, M_INFOSIZE, M_CLOCK, M_WIFI, M_ATEMIP, M_SETUP, M_LED, M_INFO, M_RESET, M_EXIT, M_COUNT, M_TOUCH };
+#endif
 int menuSel = 0;
 uint32_t uiActivity = 0;
 
@@ -718,6 +800,7 @@ String menuLabel(int i) {
     case M_ATEMIP: return "ATEM IP >";
     case M_SETUP:  return "Splet, WiFi >";
     case M_LED:    return String("RGB LED: ") + (cfgLed ? "VKLOP" : "IZKLOP");
+    case M_TOUCH:  return String("Touch: ") + (cfgTouch ? "VKLOP" : "IZKLOP");
     case M_INFO:   return "Informacije >";
     case M_RESET:  return "Ponastavi vse >";
     default:       return "Izhod";
@@ -957,6 +1040,10 @@ void menuOk() {
       cfgLed = !cfgLed;
       saveByte("led", cfgLed);
       break;
+    case M_TOUCH:
+      cfgTouch = !cfgTouch;
+      saveByte("touch", cfgTouch);
+      break;
     case M_INFO:  openInfo(); return;
     case M_ATEMIP: openIpEdit(); return;
     case M_SETUP: openSetup(); return;
@@ -1139,7 +1226,13 @@ void handleApiStatus() {
   String s = selfJson();
   s.remove(s.length() - 1);  // add the settings that only the light itself knows
   s += ",\"atemIp\":\"" + cfgAtem.toString() + "\",\"bright\":" + cfgBright + ",\"rot\":" + cfgRot +
-       ",\"led\":" + (cfgLed ? 1 : 0) + "}";
+       ",\"led\":" + (PIN_LED < 0 ? -1 : cfgLed ? 1 : 0) +  // -1 = the board doesn't have it
+#ifdef BOARD_TOUCH
+       ",\"touch\":" + (cfgTouch ? 1 : 0) +
+#else
+       ",\"touch\":-1" +
+#endif
+       ",\"board\":\"" BOARD_NAME "\"}";
   sendJson(s);
 }
 
@@ -1169,6 +1262,7 @@ void handleApiSet() {
   if (server.hasArg("cam")) { cfgCam = constrain(server.arg("cam").toInt(), 1, MAX_INPUTS); saveByte("cam", cfgCam); }
   if (server.hasArg("bright")) { cfgBright = server.arg("bright").toInt() & 3; saveByte("bright", cfgBright); }
   if (server.hasArg("led")) { cfgLed = server.arg("led").toInt() != 0; saveByte("led", cfgLed); }
+  if (server.hasArg("touch")) { cfgTouch = server.arg("touch").toInt() != 0; saveByte("touch", cfgTouch); }
   if (server.hasArg("rot")) {
     cfgRot = server.arg("rot").toInt() & 3;
     saveByte("rot", cfgRot);
@@ -1305,6 +1399,8 @@ void setup() {
   ledcWrite(PIN_BL, brightnessDuty());
   SPI.begin(PIN_SCLK, -1, PIN_MOSI, PIN_CS);
   tft.init(172, 320);
+  panelInit();
+  touchBegin();
   setLed(T_NONE);
 
   tft.setRotation(cfgRot);

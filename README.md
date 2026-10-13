@@ -15,7 +15,8 @@ Lučka se z ATEM-om pogovarja neposredno po UDP protokolu (vrata 9910), brez ra�
 - Spletna stran na `http://<IP lučke>/` ali `http://tally.local`: ATEM IP, kamera, svetlost,
   rotacija, ime lučke, seznam WiFi omrežij (do 6).
 - Več lučk se samo najde (UDP broadcast, vrata 9911); na strani katerekoli lučke urejaš vse.
-  Vsaka ima tudi svoje ime `tally-xxxx.local`.
+  Vsaka ima tudi svoje omrežno ime, narejeno iz imena lučke: "Tally lučka 1" postane
+  `tally-lucka-1` (tako jo vidi usmerjevalnik) in `http://tally-lucka-1.local`.
 - Če WiFi 30 s ni dosegljiv, se odpre dostopna točka `ATEM-Tally-XXXX`
   (geslo `AP_PASS`), stran na `http://192.168.4.1`.
 

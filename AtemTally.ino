@@ -42,7 +42,7 @@
 #define LED_BRIGHTNESS 80
 #define MAX_BUTTON_CAM 8
 #define MAX_INPUTS     64
-#define FW_VERSION     "1.8"
+#define FW_VERSION     "1.9"
 #define DISC_PORT      9911  // UDP broadcast port the lights use to find each other
 #define HOLD_MS        500   // hold = menu / OK
 #define MENU_TIMEOUT_MS 30000 // back to the main screen after 30 s without input
@@ -84,6 +84,8 @@ UiMode uiMode = UI_MAIN;
 enum BtnEvent { B_NONE, B_CLICK, B_DOUBLE, B_HOLD };
 bool apMode = false;
 String cfgName;          // editable name of this light, shown in the shared web list
+
+String hostName;         // DHCP and mDNS name derived from cfgName, e.g. tally-lucka-1
 String hostId;           // last 4 hex digits of the MAC, e.g. db40
 String apName;
 
@@ -581,7 +583,7 @@ void handleRoot() {
                ".dot{display:inline-block;width:12px;height:12px;border-radius:6px;margin-right:6px}</style>");
   h += "<h2>ATEM Tally</h2>";
   h += FPSTR(PEERS_HTML);
-  h += "<h3>Ta lucka: " + htmlEscape(cfgName) + " (tally-" + hostId + ".local)</h3>";
+  h += "<h3>Ta lucka: " + htmlEscape(cfgName) + " (" + hostName + ".local)</h3>";
   h += "<p>ATEM: " + String(atemState == A_CONNECTED ? "povezan" : "ni povezave");
   h += "<br>WiFi: " + (WiFi.status() == WL_CONNECTED ? htmlEscape(WiFi.SSID()) + " (" + WiFi.localIP().toString() + ")" : String("ni povezave")) + "</p>";
 
@@ -776,7 +778,7 @@ void drawInfo() {
   int W = tft.width(), H = tft.height();
   bool wifiUp = WiFi.status() == WL_CONNECTED;
   String lines[] = {
-    "Ime: " + cfgName + "  WiFi: " + (wifiUp ? WiFi.SSID() : String("-")),
+    "Ime: " + asciiName(cfgName) + "  WiFi: " + (wifiUp ? WiFi.SSID() : String("-")),
     "IP: " + (wifiUp ? WiFi.localIP().toString() : String("-")),
     "Signal: " + (wifiUp ? String(WiFi.RSSI()) + " dBm" : String("-")),
     "ATEM: " + cfgAtem.toString(),
@@ -1162,10 +1164,7 @@ void handleApiSet() {
   if (server.hasArg("name")) {
     String n = server.arg("name");
     n.trim();
-    if (n.length()) {
-      cfgName = n.substring(0, 24);
-      prefs.begin("tally", false); prefs.putString("name", cfgName); prefs.end();
-    }
+    if (n.length() && n != cfgName) setName(n);
   }
   if (server.hasArg("cam")) { cfgCam = constrain(server.arg("cam").toInt(), 1, MAX_INPUTS); saveByte("cam", cfgCam); }
   if (server.hasArg("bright")) { cfgBright = server.arg("bright").toInt() & 3; saveByte("bright", cfgBright); }
@@ -1209,12 +1208,67 @@ void serialLoop() {
   }
 }
 
+// Name without Slovenian diacritics (the LCD fonts are ASCII only): "Tally lučka 1" -> "Tally lucka 1".
+String asciiName(const String &s) {
+  String o;
+  for (int i = 0; i < (int)s.length(); i++) {
+    uint8_t c = s[i];
+    if (c == 0xC4 || c == 0xC5) {  // UTF-8 lead byte of č ć đ š ž (and capitals)
+      uint16_t u = (c << 8) | (i + 1 < (int)s.length() ? (uint8_t)s[++i] : 0);
+      switch (u) {
+        case 0xC48D: case 0xC487: o += 'c'; break;  // č ć
+        case 0xC48C: case 0xC486: o += 'C'; break;  // Č Ć
+        case 0xC491: o += 'd'; break;  case 0xC490: o += 'D'; break;  // đ Đ
+        case 0xC5A1: o += 's'; break;  case 0xC5A0: o += 'S'; break;  // š Š
+        case 0xC5BE: o += 'z'; break;  case 0xC5BD: o += 'Z'; break;  // ž Ž
+      }
+    } else if (c < 0x80) o += (char)c;
+  }
+  return o;
+}
+
+// "Tally lučka 1" -> "tally-lucka-1": lowercase letters/digits, anything else becomes one dash.
+String makeHostName(const String &name) {
+  String a = asciiName(name), o;
+  a.toLowerCase();
+  for (char c : a) {
+    if (isalnum((uint8_t)c)) o += c;
+    else if (o.length() && !o.endsWith("-")) o += '-';
+  }
+  while (o.endsWith("-")) o.remove(o.length() - 1);
+  return o.substring(0, 32);
+}
+
 bool aliasOwned = false;  // this light answers the shared name tally.local
+uint32_t renameAt = 0;    // millis() of a rename waiting for its WiFi rejoin
 
 void startMdns() {
   MDNS.end();
   aliasOwned = false;
-  if (MDNS.begin(("tally-" + hostId).c_str())) MDNS.addService("http", "tcp", 80);
+  if (MDNS.begin(hostName.c_str())) MDNS.addService("http", "tcp", 80);
+}
+
+// Rename the light: store it, then rejoin WiFi so the router sees the new DHCP hostname
+// (mDNS restarts with it once the connection is back).
+void setName(String n) {
+  n.trim();
+  if (n.length() > 24) n = n.substring(0, 24);
+  while (n.length() && ((uint8_t)n[n.length() - 1] & 0xC0) == 0xC0) n.remove(n.length() - 1);  // cut UTF-8 lead byte
+  if (!n.length()) return;
+  cfgName = n;
+  prefs.begin("tally", false); prefs.putString("name", cfgName); prefs.end();
+  String h = makeHostName(cfgName);
+  if (!h.length()) h = "tally-" + hostId;
+  if (h != hostName) {
+    hostName = h;
+    WiFi.setHostname(hostName.c_str());     // default for new interfaces
+    WiFi.STA.setHostname(hostName.c_str()); // the running one, used at the next DHCP request
+    renameAt = millis();                    // reconnect later, after the HTTP reply is sent
+  }
+}
+
+void renameLoop() {
+  if (renameAt && millis() - renameAt > 1000) { renameAt = 0; wifiReconnect(); }
 }
 
 // Shared name tally.local: the online light with the lowest id claims it, so when it
@@ -1262,6 +1316,10 @@ void setup() {
   char id[8]; snprintf(id, sizeof(id), "%02x%02x", mac[4], mac[5]);
   hostId = id;
   if (!cfgName.length()) cfgName = "Tally-" + hostId;
+  hostName = makeHostName(cfgName);
+  if (!hostName.length()) hostName = "tally-" + hostId;
+  WiFi.setHostname(hostName.c_str());     // default for new interfaces
+  WiFi.STA.setHostname(hostName.c_str()); // the running one, used at the next DHCP request
   discUdp.begin(DISC_PORT);
   WiFi.onEvent([](WiFiEvent_t, WiFiEventInfo_t info) {
     Serial.printf("WiFi: disconnected, reason %d\n", info.wifi_sta_disconnected.reason);
@@ -1303,6 +1361,7 @@ void loop() {
   backlightLoop();
   discoveryLoop();
   aliasLoop();
+  renameLoop();
   serialLoop();
   delay(2);
 }

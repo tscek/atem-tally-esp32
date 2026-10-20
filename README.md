@@ -3,6 +3,7 @@
 Tally lučka za Blackmagic ATEM (preizkušeno z ATEM Mini Extreme) na plošči
 **Waveshare ESP32-C6-LCD-1.47** (zaslon ST7789 172×320, RGB LED WS2812) ali
 **Waveshare ESP32-C6-Touch-LCD-1.47** (zaslon JD9853, touch AXS5106L, brez vgrajene RGB LED; zunanji WS2812 lahko priklopiš na IO8).
+ali **Waveshare ESP32-S3-LCD-1.47B** (zaslon ST7789 172×320, RGB LED WS2812).
 Lučka se z ATEM-om pogovarja neposredno po UDP protokolu (vrata 9910), brez računalnika.
 
 ## Funkcije
@@ -48,6 +49,9 @@ Samo plošča, brez dodatnega ožičenja. Napajanje prek USB-C.
 - **ESP32-C6-Touch-LCD-1.47:** zaslon MOSI 2, SCLK 1, CS 14, DC 15, RST 22, osvetlitev 23;
   touch I2C SDA 18, SCL 19, RST 20 (naslov 0x63); tipka BOOT 9.
   Zunanji WS2812 (DIN) na pin IO8 letvice, 3V3 in GND.
+- **ESP32-S3-LCD-1.47B:** zaslon MOSI 45, SCLK 40, CS 42, DC 41, RST 39, osvetlitev 46;
+  RGB LED 38; tipka BOOT 0. Prevajaš za `esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB`
+  (pini se izberejo samodejno po čipu).
 
 Na touch plošči je v meniju in na spletni strani nastavitev **Touch** (privzeto izklopljena).
 Ko je vklopljena, dotik zaslona deluje enako kot tipka BOOT (dotik = klik, drži = meni).

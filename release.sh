@@ -11,16 +11,17 @@ cd "$(dirname "$0")"
 
 CLI="${ARDUINO_CLI:-/c/Program Files/Arduino CLI/arduino-cli.exe}"
 FQBN="esp32:esp32:esp32c6:CDCOnBoot=cdc,PartitionScheme=min_spiffs"
+FQBN_S3="esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB"
 REPO="tscek/atem-tally-esp32"
 VER=$(sed -n 's/^#define FW_VERSION *"\([^"]*\)".*/\1/p' AtemTally.ino)
 OUT=build/release
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
-build() {  # board name, build dir, extra compiler flags
+build() {  # board name, build dir, extra compiler flags, FQBN (default: C6)
   local flags=()
   [ -n "$3" ] && flags=(--build-property "compiler.cpp.extra_flags=$3")
-  "$CLI" compile --fqbn "$FQBN" "${flags[@]}" --build-path "build/$2" .
+  "$CLI" compile --fqbn "${4:-$FQBN}" "${flags[@]}" --build-path "build/$2" .
   cp "build/$2/AtemTally.ino.bin" "$OUT/AtemTally-$1.bin"
 }
 
@@ -32,12 +33,14 @@ entry() {  # board name
 
 build ESP32-C6-LCD-1.47 std ""
 build ESP32-C6-Touch-LCD-1.47 touch "-DBOARD_TOUCH"
+build ESP32-S3-LCD-1.47B s3 "" "$FQBN_S3"
 {
   echo "{"
   echo "  \"version\": \"$VER\","
   echo "  \"boards\": {"
   entry ESP32-C6-LCD-1.47; echo ","
-  entry ESP32-C6-Touch-LCD-1.47; echo
+  entry ESP32-C6-Touch-LCD-1.47; echo ","
+  entry ESP32-S3-LCD-1.47B; echo
   echo "  }"
   echo "}"
 } > "$OUT/manifest.json"

@@ -1,4 +1,5 @@
-// ATEM tally light for Waveshare ESP32-C6-LCD-1.47 (ST7789 172x320, WS2812 on GPIO8)
+// ATEM tally light for Waveshare ESP32-C6-LCD-1.47 (ST7789 172x320, WS2812 on GPIO8),
+// ESP32-C6-Touch-LCD-1.47 and ESP32-S3-LCD-1.47B
 // Talks to an ATEM switcher (Mini Extreme etc.) over the ATEM UDP protocol, port 9910.
 //
 // Screen: red = program, green = preview, black = idle. Large camera number,
@@ -22,6 +23,7 @@
 #include <NetworkClientSecure.h>
 #include <Update.h>
 #include "esp_ota_ops.h"
+#include "esp_mac.h"
 #include <Preferences.h>
 #include <Wire.h>
 #include <map>
@@ -34,10 +36,22 @@
 #include <Fonts/FreeSans18pt7b.h>
 
 // ---- Board pins (Waveshare wiki / demo code) ----
-// Default: ESP32-C6-LCD-1.47 (ST7789, RGB LED). Build with -DBOARD_TOUCH for the
+// Default: ESP32-C6-LCD-1.47 (ST7789, RGB LED). Built for an ESP32-S3 target it is the
+// ESP32-S3-LCD-1.47B. Build with -DBOARD_TOUCH for the
 // ESP32-C6-Touch-LCD-1.47 (JD9853 display, AXS5106L touch). That board has no RGB LED of its
 // own; an external WS2812 can be wired to IO8 on its header.
-#ifdef BOARD_TOUCH
+#if CONFIG_IDF_TARGET_ESP32S3  // ESP32-S3-LCD-1.47B: same ST7789 172x320 panel, WS2812 on GPIO38
+#define PIN_MOSI 45
+#define PIN_SCLK 40
+#define PIN_CS   42
+#define PIN_DC   41
+#define PIN_RST  39
+#define PIN_BL   46
+#define PIN_LED  38
+#define LED_SWAP_RG 0
+#define PIN_BOOT 0
+#define BOARD_NAME "ESP32-S3-LCD-1.47B"
+#elif defined(BOARD_TOUCH)
 #define PIN_MOSI 2
 #define PIN_SCLK 1
 #define PIN_CS   14
@@ -69,7 +83,7 @@
 #define LED_BRIGHTNESS 80
 #define MAX_BUTTON_CAM 8
 #define MAX_INPUTS     64
-#define FW_VERSION     "2.3"
+#define FW_VERSION     "2.4"
 #define OTA_REPO       "tscek/atem-tally-esp32"  // GitHub releases with manifest.json + .bin per board
 #define DISC_PORT      9911  // UDP broadcast port the lights use to find each other
 #define HOLD_MS        500   // hold = menu / OK
@@ -744,7 +758,7 @@ void handleDelWifi() {
 void startAP() {
   if (apMode) return;
   apMode = true;
-  uint8_t mac[6]; WiFi.macAddress(mac);
+  uint8_t mac[6]; esp_read_mac(mac, ESP_MAC_WIFI_STA);
   char n[24]; snprintf(n, sizeof(n), "ATEM-Tally-%02X%02X", mac[4], mac[5]);
   apName = n;
   WiFi.mode(WIFI_AP_STA);  // keep trying the station connection in the background
@@ -1870,7 +1884,7 @@ void setup() {
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-  uint8_t mac[6]; WiFi.macAddress(mac);
+  uint8_t mac[6]; esp_read_mac(mac, ESP_MAC_WIFI_STA);  // from eFuse: WiFi.macAddress() can still be 0 here on the S3
   char id[8]; snprintf(id, sizeof(id), "%02x%02x", mac[4], mac[5]);
   hostId = id;
   if (!cfgName.length()) cfgName = "Tally-" + hostId;

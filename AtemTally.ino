@@ -5,7 +5,7 @@
 // camera name (ATEM input label) in small text below it.
 // BOOT button on the main screen: click = next camera 1..8, hold 0.5 s = menu.
 // Menu (rotation, brightness, WiFi, RGB LED, info, reset): click = next item,
-// hold = OK, double click = back. The backlight pulses while WiFi/ATEM is down.
+// hold = OK, 2 s idle = back. The backlight pulses while WiFi/ATEM is down.
 // ATEM IP and camera can be changed at http://<tally IP>/. If WiFi can't be
 // reached for 30 s, AP "ATEM-Tally-XXXX" (password AP_PASS) opens with the same
 // page at http://192.168.4.1. Settings are stored in NVS.
@@ -35,7 +35,8 @@
 
 // ---- Board pins (Waveshare wiki / demo code) ----
 // Default: ESP32-C6-LCD-1.47 (ST7789, RGB LED). Build with -DBOARD_TOUCH for the
-// ESP32-C6-Touch-LCD-1.47 (JD9853 display, AXS5106L touch, no RGB LED).
+// ESP32-C6-Touch-LCD-1.47 (JD9853 display, AXS5106L touch). That board has no RGB LED of its
+// own; an external WS2812 can be wired to IO8 on its header.
 #ifdef BOARD_TOUCH
 #define PIN_MOSI 2
 #define PIN_SCLK 1
@@ -43,7 +44,8 @@
 #define PIN_DC   15
 #define PIN_RST  22
 #define PIN_BL   23
-#define PIN_LED  -1
+#define PIN_LED  8   // header pin IO8, external WS2812 (standard GRB order)
+#define LED_SWAP_RG 0
 #define PIN_BOOT 9
 #define PIN_TP_SDA 18
 #define PIN_TP_SCL 19
@@ -58,6 +60,7 @@
 #define PIN_RST  21
 #define PIN_BL   22
 #define PIN_LED  8
+#define LED_SWAP_RG 1  // the on-board LED has red and green swapped
 #define PIN_BOOT 9
 #define BOARD_NAME "ESP32-C6-LCD-1.47"
 #endif
@@ -66,12 +69,13 @@
 #define LED_BRIGHTNESS 80
 #define MAX_BUTTON_CAM 8
 #define MAX_INPUTS     64
-#define FW_VERSION     "2.2"
+#define FW_VERSION     "2.3"
 #define OTA_REPO       "tscek/atem-tally-esp32"  // GitHub releases with manifest.json + .bin per board
 #define DISC_PORT      9911  // UDP broadcast port the lights use to find each other
 #define HOLD_MS        500   // hold = menu / OK
-#define MENU_TIMEOUT_MS 30000 // back to the main screen after 30 s without input
-#define DOUBLE_MS      350   // second click within this time = double click
+#define MENU_TIMEOUT_MS 2000  // menu: back to the main screen after 2 s without input
+#define EDIT_TIMEOUT_MS 10000 // ATEM IP editor, reset question
+#define VIEW_TIMEOUT_MS 30000 // info and web setup screens
 #define PULSE_MS       2000  // backlight pulse period when a connection is down
 #define STATUS_H       22
 #define BOTTOM_H       14
@@ -105,12 +109,13 @@ uint8_t cfgClock = CLOCK_HMS;
 String netSsid[MAX_NETS], netPass[MAX_NETS];
 int netRssi[MAX_NETS];    // signal from the last scan, -999 = not seen
 uint32_t renameAt = 0;    // millis() of a rename / network change waiting for its WiFi rejoin
+uint32_t restartAt = 0;   // millis() of a WiFi choice on the web page; restarts 1 s later
 uint32_t scanWantedAt = 0;  // web page asked for fresh signal values (see webScanLoop)
 int netCount = 0;
 
 enum UiMode { UI_MAIN, UI_MENU, UI_INFO, UI_RESET, UI_IPEDIT, UI_SETUP, UI_OTA };
 UiMode uiMode = UI_MAIN;
-enum BtnEvent { B_NONE, B_CLICK, B_DOUBLE, B_HOLD };
+enum BtnEvent { B_NONE, B_CLICK, B_HOLD };
 enum OtaJob { OJ_IDLE, OJ_CHECKING, OJ_FOUND, OJ_LATEST, OJ_FAILED, OJ_DOWNLOADING, OJ_DONE };
 enum OtaScreen { OS_CHECKING, OS_OFFER, OS_PROGRESS, OS_MESSAGE };
 volatile OtaJob otaJob = OJ_IDLE;   // written by the OTA task, consumed in otaLoop
@@ -189,12 +194,9 @@ Tally currentTally() {
 void setLed(Tally t) {
   if (PIN_LED < 0) return;
   if (!cfgLed) t = T_NONE;
-  switch (t) {
-    // This board's LED has red and green swapped compared to rgbLedWrite's GRB order.
-    case T_PROGRAM: rgbLedWrite(PIN_LED, 0, LED_BRIGHTNESS, 0); break;
-    case T_PREVIEW: rgbLedWrite(PIN_LED, LED_BRIGHTNESS, 0, 0); break;
-    default:        rgbLedWrite(PIN_LED, 0, 0, 0); break;
-  }
+  uint8_t r = t == T_PROGRAM ? LED_BRIGHTNESS : 0, g = t == T_PREVIEW ? LED_BRIGHTNESS : 0;
+  if (LED_SWAP_RG) std::swap(r, g);  // on-board LED: red and green swapped vs rgbLedWrite's GRB order
+  rgbLedWrite(PIN_LED, r, g, 0);
 }
 
 String smallLine() {
@@ -825,33 +827,28 @@ void panelInit() {
 }
 
 // ---------------------------------------------------------------- button
-// Turns the raw BOOT button into click / double click / hold events. Double
-// clicks are only detected when asked for (in the menu), so a click on the main
-// screen reacts immediately.
-BtnEvent readButton(bool wantDouble) {
-  static uint32_t downAt = 0, clickAt = 0;
-  static bool wasDown = false, held = false, pending = false;
+// Turns the raw BOOT button into click / hold events. A click fires on release, so
+// two quick clicks are simply two clicks.
+BtnEvent readButton() {
+  static uint32_t downAt = 0;
+  static bool wasDown = false, held = false;
   uint32_t now = millis();
   bool down = digitalRead(PIN_BOOT) == LOW || touchDown();  // a touch acts like the button
   BtnEvent ev = B_NONE;
 
   if (down && !wasDown) { downAt = now; held = false; }
-  if (down && !held && now - downAt >= HOLD_MS) { held = true; pending = false; ev = B_HOLD; }
-  if (!down && wasDown && !held && now - downAt > 30) {
-    if (!wantDouble) ev = B_CLICK;
-    else if (pending) { pending = false; ev = B_DOUBLE; }
-    else { pending = true; clickAt = now; }
-  }
-  if (pending && !down && now - clickAt > DOUBLE_MS) { pending = false; ev = B_CLICK; }
+  if (down && !held && now - downAt >= HOLD_MS) { held = true; ev = B_HOLD; }
+  if (!down && wasDown && !held && now - downAt > 30) ev = B_CLICK;
   wasDown = down;
   return ev;
 }
 
 // ---------------------------------------------------------------- menu
 // Main screen: click = next camera 1..8, hold = open menu.
-// Menu: click = next item, hold = OK (change value / open), double click = back.
-#ifdef BOARD_TOUCH  // no RGB LED on the touch board, but a touch on/off item
-enum MenuItem { M_ROT, M_BRIGHT, M_NUMSIZE, M_INFOSIZE, M_CLOCK, M_WIFI, M_ATEMIP, M_SETUP, M_TOUCH, M_UPDATE, M_INFO, M_RESET, M_EXIT, M_COUNT, M_LED };
+// Menu: click = next item, hold = OK (change value / open). 2 s without a press = back to
+// the main screen (sub-screens wait longer, see uiTimeout).
+#ifdef BOARD_TOUCH  // the touch board also has a touch on/off item
+enum MenuItem { M_ROT, M_BRIGHT, M_NUMSIZE, M_INFOSIZE, M_CLOCK, M_WIFI, M_ATEMIP, M_SETUP, M_LED, M_TOUCH, M_UPDATE, M_INFO, M_RESET, M_EXIT, M_COUNT };
 #else
 enum MenuItem { M_ROT, M_BRIGHT, M_NUMSIZE, M_INFOSIZE, M_CLOCK, M_WIFI, M_ATEMIP, M_SETUP, M_LED, M_UPDATE, M_INFO, M_RESET, M_EXIT, M_COUNT, M_TOUCH };
 #endif
@@ -924,7 +921,7 @@ void drawMenu() {
     else tft.setCursor(10, y + 16);
     tft.print(label);
   }
-  drawHint("klik=naprej drzi=OK 2x=nazaj");
+  drawHint("klik=naprej drzi=OK");
 }
 
 String uptimeText() {
@@ -970,7 +967,7 @@ void openInfo() {
   tft.fillScreen(COLOR_MENU);
   drawTitle("INFO");
   drawInfo();
-  drawHint("klik ali 2x = nazaj");
+  drawHint("klik = nazaj");
 }
 
 void drawResetConfirm() {
@@ -986,7 +983,7 @@ void drawResetConfirm() {
 }
 
 // ---- ATEM IP editor: 12 digits (3 per octet). Click = digit +1, hold = next
-// digit (hold on the last one saves), double click = previous digit / cancel.
+// digit (hold on the last one saves). 10 s without a press cancels.
 uint8_t ipDigits[12];
 int ipPos = 0;
 
@@ -1027,7 +1024,7 @@ void drawIpEdit() {
     }
   }
   tft.setTextSize(1);
-  drawHint(ipPos == 11 ? "klik=+1 drzi=SHRANI 2x=nazaj" : "klik=+1 drzi=naprej 2x=nazaj");
+  drawHint(ipPos == 11 ? "klik=+1 drzi=SHRANI" : "klik=+1 drzi=naprej");
 }
 
 void ipEditEvent(BtnEvent ev) {
@@ -1039,10 +1036,7 @@ void ipEditEvent(BtnEvent ev) {
     IPAddress ip;
     for (int o = 0; o < 4; o++) ip[o] = min(255, ipDigits[o * 3] * 100 + ipDigits[o * 3 + 1] * 10 + ipDigits[o * 3 + 2]);
     setAtemIp(ip);
-    uiMode = UI_MENU;
-    redraw();
-  } else if (ev == B_DOUBLE) {
-    if (--ipPos < 0) { uiMode = UI_MENU; redraw(); } else drawIpEdit();
+    openMain();
   }
 }
 
@@ -1076,10 +1070,26 @@ void drawSetup() {
     else tft.setCursor(6, STATUS_H + 18 + i * lineH);
     tft.print(lines[i]);
   }
-  drawHint("klik ali 2x = nazaj");
+  drawHint("klik = nazaj");
+}
+
+// A WiFi network chosen in the menu takes effect with a restart once the menu closes.
+bool wifiRestartPending = false;
+
+void restartNow(const char *why) {
+  Serial.printf("Restart: %s\n", why);
+  tft.fillScreen(COLOR_MENU);
+  drawTitle("PONOVNI ZAGON");
+  tft.setFont(&FreeSans9pt7b);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(8, STATUS_H + 30);
+  tft.print(why);
+  delay(800);
+  ESP.restart();
 }
 
 void openMain() {
+  if (wifiRestartPending) restartNow(("WiFi: " + netSsid[cfgWifi]).c_str());
   uiMode = UI_MAIN;
   redraw();
 }
@@ -1111,7 +1121,7 @@ void menuOk() {
       if (!netCount) break;
       cfgWifi = (cfgWifi + 1) % netCount;
       saveByte("wifi", cfgWifi);
-      wifiReconnect();
+      wifiRestartPending = WiFi.SSID() != netSsid[cfgWifi];  // restart when the menu closes
       break;
     case M_LED:
       cfgLed = !cfgLed;
@@ -1131,12 +1141,21 @@ void menuOk() {
   redraw();
 }
 
+// How long a screen waits for a press before going back to the main screen.
+uint32_t uiTimeout() {
+  switch (uiMode) {
+    case UI_IPEDIT: case UI_RESET: return EDIT_TIMEOUT_MS;
+    case UI_INFO: case UI_SETUP:   return VIEW_TIMEOUT_MS;
+    default:                       return MENU_TIMEOUT_MS;
+  }
+}
+
 void uiLoop() {
-  BtnEvent ev = readButton(uiMode != UI_MAIN && uiMode != UI_OTA);
+  BtnEvent ev = readButton();
   uint32_t now = millis();
   if (uiMode == UI_OTA) { otaUiEvent(ev); return; }  // has its own timeouts
   if (ev != B_NONE) uiActivity = now;
-  else if (uiMode != UI_MAIN && now - uiActivity > MENU_TIMEOUT_MS) { openMain(); return; }
+  else if (uiMode != UI_MAIN && now - uiActivity > uiTimeout()) { openMain(); return; }
 
   switch (uiMode) {
     case UI_MAIN:
@@ -1153,10 +1172,9 @@ void uiLoop() {
     case UI_MENU:
       if (ev == B_CLICK) { menuSel = (menuSel + 1) % M_COUNT; redraw(); }
       else if (ev == B_HOLD) menuOk();
-      else if (ev == B_DOUBLE) openMain();
       break;
     case UI_INFO:
-      if (ev == B_CLICK || ev == B_DOUBLE) { uiMode = UI_MENU; redraw(); }
+      if (ev == B_CLICK) openMain();
       else {
         static uint32_t lastInfo = 0;
         if (now - lastInfo > 1000) { lastInfo = now; drawInfo(); }
@@ -1166,7 +1184,7 @@ void uiLoop() {
       ipEditEvent(ev);
       break;
     case UI_SETUP:
-      if (ev == B_CLICK || ev == B_DOUBLE) { uiMode = UI_MENU; redraw(); }
+      if (ev == B_CLICK) openMain();
       break;
     case UI_RESET:
       if (ev == B_HOLD) {
@@ -1176,7 +1194,7 @@ void uiLoop() {
         tft.fillScreen(ST77XX_BLUE);
         delay(300);
         ESP.restart();
-      } else if (ev == B_CLICK || ev == B_DOUBLE) { uiMode = UI_MENU; redraw(); }
+      } else if (ev == B_CLICK) openMain();
       break;
   }
 }
@@ -1383,7 +1401,7 @@ void handleApiSet() {
     if (k >= 0 && k < netCount && k != cfgWifi) {
       cfgWifi = k;
       saveByte("wifi", cfgWifi);
-      if (WiFi.SSID() != netSsid[k]) renameAt = millis();  // rejoin after the reply is sent
+      if (WiFi.SSID() != netSsid[k]) restartAt = millis();  // restart after the reply is sent
     }
   }
   if (server.hasArg("rot")) {
@@ -1399,7 +1417,8 @@ void handleApiSet() {
   handleApiStatus();
 }
 
-// Serial console (115200): "wifi <ssid>" selects a known network, "status" prints state,
+// Serial console (115200): "wifi <ssid>" selects a known network (and restarts), "atem <ip>"
+// sets the switcher address, "status" prints state,
 // "ota" checks for an update (like the menu item), "reboot" restarts.
 void serialLoop() {
   static String line;
@@ -1414,9 +1433,12 @@ void serialLoop() {
       if (i < netCount) {
         cfgWifi = i;
         saveByte("wifi", cfgWifi);
-        wifiReconnect();
-        Serial.printf("WiFi: switching to %s\n", ssid.c_str());
+        restartNow(("WiFi: " + ssid).c_str());
       } else Serial.println("WiFi: unknown network");
+    } else if (line.startsWith("atem ")) {
+      IPAddress ip;
+      if (ip.fromString(line.substring(5))) { setAtemIp(ip); redraw(); Serial.printf("ATEM IP %s\n", ip.toString().c_str()); }
+      else Serial.println("ATEM: invalid IP");
     } else if (line == "reboot") {
       ESP.restart();
     } else if (line == "ota") {
@@ -1491,6 +1513,7 @@ void setName(String n) {
 }
 
 void renameLoop() {
+  if (restartAt && millis() - restartAt > 1000) { restartAt = 0; restartNow(("WiFi: " + netSsid[cfgWifi]).c_str()); }
   if (renameAt && millis() - renameAt > 1000) { renameAt = 0; wifiReconnect(); }
 }
 

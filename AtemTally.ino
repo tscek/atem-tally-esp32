@@ -35,55 +35,49 @@
 #include <Fonts/FreeSans12pt7b.h>
 #include <Fonts/FreeSans18pt7b.h>
 
-// ---- Board pins (Waveshare wiki / demo code) ----
-// Default: ESP32-C6-LCD-1.47 (ST7789, RGB LED). Built for an ESP32-S3 target it is the
-// ESP32-S3-LCD-1.47B. Build with -DBOARD_TOUCH for the
-// ESP32-C6-Touch-LCD-1.47 (JD9853 display, AXS5106L touch). That board has no RGB LED of its
-// own; an external WS2812 can be wired to IO8 on its header.
-#if CONFIG_IDF_TARGET_ESP32S3  // ESP32-S3-LCD-1.47B: same ST7789 172x320 panel, WS2812 on GPIO38
-#define PIN_MOSI 45
-#define PIN_SCLK 40
-#define PIN_CS   42
-#define PIN_DC   41
-#define PIN_RST  39
-#define PIN_BL   46
-#define PIN_LED  38
-#define LED_SWAP_RG 0
-#define PIN_BOOT 0
-#define BOARD_NAME "ESP32-S3-LCD-1.47B"
-#elif defined(BOARD_TOUCH)
-#define PIN_MOSI 2
-#define PIN_SCLK 1
-#define PIN_CS   14
-#define PIN_DC   15
-#define PIN_RST  22
-#define PIN_BL   23
-#define PIN_LED  8   // header pin IO8, external WS2812 (standard GRB order)
-#define LED_SWAP_RG 0
-#define PIN_BOOT 9
-#define PIN_TP_SDA 18
-#define PIN_TP_SCL 19
-#define PIN_TP_RST 20
-#define TP_ADDR    0x63
-#define BOARD_NAME "ESP32-C6-Touch-LCD-1.47"
+// ---- Boards (pins from the Waveshare wikis / demo code) ----
+// One firmware per chip; the board is recognised at boot (see detectBoard):
+//   ESP32-C6-LCD-1.47        ST7789 172x320, WS2812 on GPIO8 (red/green swapped)
+//   ESP32-C6-LCD-1.3         ST7789 240x240, same pins as the 1.47; can't be told apart from it,
+//                            so it is chosen in the menu (NVS "board")
+//   ESP32-C6-Touch-LCD-1.47  JD9853 172x320, AXS5106L touch on I2C 18/19; no RGB LED of its
+//                            own, an external WS2812 can be wired to IO8 on the header
+//   ESP32-S3-LCD-1.47B       ST7789 172x320, WS2812 on GPIO38
+enum Panel { P_ST7789, P_JD9853 };
+struct Board {
+  const char *name;
+  int8_t mosi, sclk, cs, dc, rst, bl, led;
+  bool swapRG;        // LED has red and green swapped vs rgbLedWrite's GRB order
+  int8_t boot;
+  int8_t tpSda, tpScl, tpRst;  // touch controller, -1 = none
+  Panel panel;
+  uint16_t w, h;      // panel size in portrait
+  const char *shortName;  // for the menu
+};
+#define TP_ADDR 0x63  // AXS5106L
+#define IMU_ADDR 0x6B // QMI8658, also on the touch board's I2C bus
+
+#if CONFIG_IDF_TARGET_ESP32S3
+#define CHIP_NAME "ESP32-S3"
+const Board boards[] = {
+  {"ESP32-S3-LCD-1.47B", 45, 40, 42, 41, 39, 46, 38, false, 0, -1, -1, -1, P_ST7789, 172, 320, "S3 1.47"},
+};
 #else
-#define PIN_MOSI 6
-#define PIN_SCLK 7
-#define PIN_CS   14
-#define PIN_DC   15
-#define PIN_RST  21
-#define PIN_BL   22
-#define PIN_LED  8
-#define LED_SWAP_RG 1  // the on-board LED has red and green swapped
-#define PIN_BOOT 9
-#define BOARD_NAME "ESP32-C6-LCD-1.47"
+#define CHIP_NAME "ESP32-C6"
+const Board boards[] = {
+  {"ESP32-C6-LCD-1.47",       6, 7, 14, 15, 21, 22, 8, true,  9, -1, -1, -1, P_ST7789, 172, 320, "1.47"},
+  {"ESP32-C6-LCD-1.3",        6, 7, 14, 15, 21, 22, 8, false, 9, -1, -1, -1, P_ST7789, 240, 240, "1.3"},
+  {"ESP32-C6-Touch-LCD-1.47", 2, 1, 14, 15, 22, 23, 8, false, 9, 18, 19, 20, P_JD9853, 172, 320, "Touch 1.47"},
+};
 #endif
+const Board *board = &boards[0];
+
 
 #define ATEM_PORT      9910
 #define LED_BRIGHTNESS 80
 #define MAX_BUTTON_CAM 8
 #define MAX_INPUTS     64
-#define FW_VERSION     "2.4"
+#define FW_VERSION     "2.5"
 #define OTA_REPO       "tscek/atem-tally-esp32"  // GitHub releases with manifest.json + .bin per board
 #define DISC_PORT      9911  // UDP broadcast port the lights use to find each other
 #define HOLD_MS        500   // hold = menu / OK
@@ -99,7 +93,8 @@
 #define COLOR_GREY  0x2104
 #define COLOR_MENU  0x0846
 
-Adafruit_ST7789 tft(PIN_CS, PIN_DC, PIN_RST);
+Adafruit_ST7789 *display = nullptr;  // created in setup once the board (pins) is known
+#define tft (*display)
 Preferences prefs;
 WebServer server(80);
 DNSServer dns;
@@ -156,6 +151,43 @@ uint32_t atemGaps = 0;    // out-of-order packets dropped (the ATEM resends them
 uint32_t atemConnectedAt = 0;  // for the "tally shown after ... ms" log line
 uint8_t buf[2048];
 
+// -------------------------------------------------------------- board detection
+// The touch board has an I2C bus on 18/19 with the touch controller and the IMU; on the
+// other C6 board those pins are unused, so probing them is harmless.
+bool i2cPresent(int sda, int scl, int rst, uint8_t addr1, uint8_t addr2) {
+  if (rst >= 0) { pinMode(rst, OUTPUT); digitalWrite(rst, LOW); delay(10); digitalWrite(rst, HIGH); delay(50); }
+  Wire.begin(sda, scl, 100000);
+  bool found = false;
+  for (uint8_t a : {addr1, addr2}) { Wire.beginTransmission(a); if (Wire.endTransmission() == 0) found = true; }
+  Wire.end();
+  return found;
+}
+
+void detectBoard() {
+  for (const Board &b : boards)
+    if (b.tpSda >= 0 && i2cPresent(b.tpSda, b.tpScl, b.tpRst, TP_ADDR, IMU_ADDR)) { board = &b; break; }
+  if (!hasTouch()) {  // boards without I2C devices look the same: use the one chosen in the menu
+    prefs.begin("tally", true);
+    String chosen = prefs.getString("board", "");
+    prefs.end();
+    for (const Board &b : boards)
+      if (b.tpSda < 0 && chosen == b.name) board = &b;
+  }
+  Serial.printf("Board: %s\n", board->name);
+}
+bool hasTouch() { return board->tpSda >= 0; }
+// Boards that can only be chosen by hand (no touch controller to detect them).
+int boardChoices() {
+  int n = 0;
+  for (const Board &b : boards) n += b.tpSda < 0;
+  return n;
+}
+void saveBoard(const char *name) {
+  prefs.begin("tally", false);
+  prefs.putString("board", name);
+  prefs.end();
+}
+
 // ---------------------------------------------------------------- config
 void loadConfig() {
   prefs.begin("tally", true);
@@ -206,11 +238,11 @@ Tally currentTally() {
 }
 
 void setLed(Tally t) {
-  if (PIN_LED < 0) return;
+  if (board->led < 0) return;
   if (!cfgLed) t = T_NONE;
   uint8_t r = t == T_PROGRAM ? LED_BRIGHTNESS : 0, g = t == T_PREVIEW ? LED_BRIGHTNESS : 0;
-  if (LED_SWAP_RG) std::swap(r, g);  // on-board LED: red and green swapped vs rgbLedWrite's GRB order
-  rgbLedWrite(PIN_LED, r, g, 0);
+  if (board->swapRG) std::swap(r, g);
+  rgbLedWrite(board->led, r, g, 0);
 }
 
 String smallLine() {
@@ -782,24 +814,24 @@ void backlightLoop() {
     float k = 0.625f + 0.375f * cosf(phase * 2 * PI);
     duty = max(8, (int)(duty * k));
   }
-  ledcWrite(PIN_BL, duty);
+  ledcWrite(board->bl, duty);
 }
 
 // ---------------------------------------------------------------- touch
 // AXS5106L on I2C: register 0x01 holds the number of touch points in the low nibble
 // of the second byte. Only "is it touched" is used, so the screen works as one big button.
-#ifdef BOARD_TOUCH
 void touchBegin() {
-  pinMode(PIN_TP_RST, OUTPUT);
-  digitalWrite(PIN_TP_RST, LOW);  delay(10);
-  digitalWrite(PIN_TP_RST, HIGH); delay(10);
-  Wire.begin(PIN_TP_SDA, PIN_TP_SCL, 400000);
+  if (!hasTouch()) return;
+  pinMode(board->tpRst, OUTPUT);
+  digitalWrite(board->tpRst, LOW);  delay(10);
+  digitalWrite(board->tpRst, HIGH); delay(10);
+  Wire.begin(board->tpSda, board->tpScl, 400000);
 }
 
 bool touchDown() {
   static uint32_t lastPoll = 0;
   static bool down = false;
-  if (!cfgTouch && uiMode != UI_OTA) return false;  // the update offer always takes a tap
+  if (!hasTouch() || (!cfgTouch && uiMode != UI_OTA)) return false;  // the update offer always takes a tap
   if (millis() - lastPoll < 20) return down;
   lastPoll = millis();
   uint8_t d[2] = {0, 0};
@@ -809,15 +841,11 @@ bool touchDown() {
   down = (d[1] & 0x0F) != 0;
   return down;
 }
-#else
-void touchBegin() {}
-bool touchDown() { return false; }
-#endif
 
 // The JD9853 understands the ST7789 commands Adafruit_ST7789 sends, but needs its own
 // panel settings on top (from Waveshare's esp_lcd_jd9853 driver).
 void panelInit() {
-#ifdef BOARD_TOUCH
+  if (board->panel != P_JD9853) return;
   struct Cmd { uint8_t cmd, len; uint8_t data[32]; };
   static const Cmd cmds[] = {
     {0xDF, 2, {0x98, 0x53}}, {0xDF, 2, {0x98, 0x53}}, {0xB2, 1, {0x23}},
@@ -837,7 +865,6 @@ void panelInit() {
   };
   for (const Cmd &c : cmds) tft.sendCommand(c.cmd, c.data, c.len);
   tft.invertDisplay(true);
-#endif
 }
 
 // ---------------------------------------------------------------- button
@@ -847,7 +874,7 @@ BtnEvent readButton() {
   static uint32_t downAt = 0;
   static bool wasDown = false, held = false;
   uint32_t now = millis();
-  bool down = digitalRead(PIN_BOOT) == LOW || touchDown();  // a touch acts like the button
+  bool down = digitalRead(board->boot) == LOW || touchDown();  // a touch acts like the button
   BtnEvent ev = B_NONE;
 
   if (down && !wasDown) { downAt = now; held = false; }
@@ -861,11 +888,14 @@ BtnEvent readButton() {
 // Main screen: click = next camera 1..8, hold = open menu.
 // Menu: click = next item, hold = OK (change value / open). 2 s without a press = back to
 // the main screen (sub-screens wait longer, see uiTimeout).
-#ifdef BOARD_TOUCH  // the touch board also has a touch on/off item
-enum MenuItem { M_ROT, M_BRIGHT, M_NUMSIZE, M_INFOSIZE, M_CLOCK, M_WIFI, M_ATEMIP, M_SETUP, M_LED, M_TOUCH, M_UPDATE, M_INFO, M_RESET, M_EXIT, M_COUNT };
-#else
-enum MenuItem { M_ROT, M_BRIGHT, M_NUMSIZE, M_INFOSIZE, M_CLOCK, M_WIFI, M_ATEMIP, M_SETUP, M_LED, M_UPDATE, M_INFO, M_RESET, M_EXIT, M_COUNT, M_TOUCH };
-#endif
+enum MenuItem { M_ROT, M_BRIGHT, M_NUMSIZE, M_INFOSIZE, M_CLOCK, M_WIFI, M_ATEMIP, M_SETUP, M_LED, M_TOUCH, M_BOARD, M_UPDATE, M_INFO, M_RESET, M_EXIT, M_COUNT };
+// Items shown on this board (Touch only where there is a touch screen); menuSel indexes this list.
+int menuItems[M_COUNT], menuCount = 0;
+void buildMenu() {
+  menuCount = 0;
+  for (int i = 0; i < M_COUNT; i++)
+    if ((i != M_TOUCH || hasTouch()) && (i != M_BOARD || (!hasTouch() && boardChoices() > 1))) menuItems[menuCount++] = i;
+}
 int menuSel = 0;
 uint32_t uiActivity = 0;
 
@@ -883,6 +913,7 @@ String menuLabel(int i) {
     case M_SETUP:  return "Splet, WiFi >";
     case M_LED:    return String("RGB LED: ") + (cfgLed ? "VKLOP" : "IZKLOP");
     case M_TOUCH:  return String("Touch: ") + (cfgTouch ? "VKLOP" : "IZKLOP");
+    case M_BOARD:  return String("Plosca: ") + board->shortName;
     case M_UPDATE: return "Preveri posodobitve >";
     case M_INFO:   return "Informacije >";
     case M_RESET:  return "Ponastavi vse >";
@@ -922,12 +953,12 @@ void drawMenu() {
   tft.fillScreen(COLOR_MENU);
   drawTitle("MENI  CAM " + String(cfgCam));
   tft.setFont(&FreeSans9pt7b);
-  for (int r = 0; r < visible && first + r < M_COUNT; r++) {
+  for (int r = 0; r < visible && first + r < menuCount; r++) {
     int i = first + r, y = top + r * rowH;
     bool sel = i == menuSel;
     if (sel) tft.fillRoundRect(3, y, W - 6, rowH - 2, 4, ST77XX_WHITE);
     tft.setTextColor(sel ? ST77XX_BLACK : ST77XX_WHITE);
-    String label = menuLabel(i);
+    String label = menuLabel(menuItems[i]);
     int16_t x1, y1; uint16_t w, h;
     tft.setFont(&FreeSans9pt7b);
     tft.getTextBounds(label, 0, 0, &x1, &y1, &w, &h);
@@ -1109,7 +1140,7 @@ void openMain() {
 }
 
 void menuOk() {
-  switch (menuSel) {
+  switch (menuItems[menuSel]) {
     case M_ROT:
       cfgRot = (cfgRot + 1) & 3;
       saveByte("rot", cfgRot);
@@ -1145,6 +1176,13 @@ void menuOk() {
       cfgTouch = !cfgTouch;
       saveByte("touch", cfgTouch);
       break;
+    case M_BOARD: {  // next board with the same pins (no way to detect it), applied by a restart
+      int n = sizeof(boards) / sizeof(boards[0]), i = board - boards;
+      do i = (i + 1) % n; while (boards[i].tpSda >= 0);
+      saveBoard(boards[i].name);
+      restartNow((String("Plosca: ") + boards[i].shortName).c_str());
+      return;
+    }
     case M_INFO:  openInfo(); return;
     case M_UPDATE: otaManualCheck(); return;
     case M_ATEMIP: openIpEdit(); return;
@@ -1184,7 +1222,7 @@ void uiLoop() {
       }
       break;
     case UI_MENU:
-      if (ev == B_CLICK) { menuSel = (menuSel + 1) % M_COUNT; redraw(); }
+      if (ev == B_CLICK) { menuSel = (menuSel + 1) % menuCount; redraw(); }
       else if (ev == B_HOLD) menuOk();
       break;
     case UI_INFO:
@@ -1367,13 +1405,9 @@ void handleApiStatus() {
   String s = selfJson();
   s.remove(s.length() - 1);  // add the settings that only the light itself knows
   s += ",\"atemIp\":\"" + cfgAtem.toString() + "\",\"bright\":" + cfgBright + ",\"rot\":" + cfgRot +
-       ",\"led\":" + (PIN_LED < 0 ? -1 : cfgLed ? 1 : 0) +  // -1 = the board doesn't have it
-#ifdef BOARD_TOUCH
-       ",\"touch\":" + (cfgTouch ? 1 : 0) +
-#else
-       ",\"touch\":-1" +
-#endif
-       ",\"board\":\"" BOARD_NAME "\"";
+       ",\"led\":" + (board->led < 0 ? -1 : cfgLed ? 1 : 0) +  // -1 = the board doesn't have it
+       ",\"touch\":" + (hasTouch() ? (cfgTouch ? 1 : 0) : -1) +
+       ",\"board\":\"" + String(board->name) + "\"";
   // Saved networks with their signal (-999 = not seen in the last scan), "wifi" = chosen one.
   s += ",\"wifi\":" + String(cfgWifi) + ",\"scanning\":" + (webScanning ? "true" : "false") + ",\"nets\":[";
   for (int k = 0; k < netCount; k++)
@@ -1432,7 +1466,7 @@ void handleApiSet() {
 }
 
 // Serial console (115200): "wifi <ssid>" selects a known network (and restarts), "atem <ip>"
-// sets the switcher address, "status" prints state,
+// sets the switcher address, "board <name>" picks the board (e.g. ESP32-C6-LCD-1.3), "status" prints state,
 // "ota" checks for an update (like the menu item), "reboot" restarts.
 void serialLoop() {
   static String line;
@@ -1449,6 +1483,12 @@ void serialLoop() {
         saveByte("wifi", cfgWifi);
         restartNow(("WiFi: " + ssid).c_str());
       } else Serial.println("WiFi: unknown network");
+    } else if (line.startsWith("board ")) {  // e.g. "board ESP32-C6-LCD-1.3"
+      String name = line.substring(6);
+      bool known = false;
+      for (const Board &b : boards) known |= name == b.name;
+      if (known) { saveBoard(name.c_str()); restartNow(name.c_str()); }
+      else Serial.println("board: unknown name");
     } else if (line.startsWith("atem ")) {
       IPAddress ip;
       if (ip.fromString(line.substring(5))) { setAtemIp(ip); redraw(); Serial.printf("ATEM IP %s\n", ip.toString().c_str()); }
@@ -1461,8 +1501,8 @@ void serialLoop() {
       Serial.printf("name %s, WiFi %s %s, ATEM %s %s, peers %d\n", cfgName.c_str(), WiFi.SSID().c_str(),
                     WiFi.localIP().toString().c_str(), cfgAtem.toString().c_str(),
                     atemState == A_CONNECTED ? "connected" : "not connected", peerCount);
-      Serial.printf("cam %d tally %d (TlIn %d inputs), PGM %d PVW %d, dropped %lu, FW " FW_VERSION "\n", cfgCam,
-                    (int)currentTally(), tallyCount, programSource, previewSource, atemGaps);
+      Serial.printf("cam %d tally %d (TlIn %d inputs), PGM %d PVW %d, dropped %lu, FW " FW_VERSION " on %s\n", cfgCam,
+                    (int)currentTally(), tallyCount, programSource, previewSource, atemGaps, board->name);
     }
     line = "";
   }
@@ -1629,7 +1669,7 @@ OtaJob otaCheck() {
   String js = http.getString();
   http.end();
   String v = jsonValue(js, "version");
-  int b = js.indexOf("\"" BOARD_NAME "\"");
+  int b = js.indexOf("\"" CHIP_NAME "\"");  // one image per chip; the board is detected at boot
   if (!v.length() || b < 0) { otaError = "napacen manifest"; return OJ_FAILED; }
   Serial.printf("OTA: latest %s, running " FW_VERSION "\n", v.c_str());
   if (versionCmp(v, FW_VERSION) <= 0) return OJ_LATEST;
@@ -1868,13 +1908,16 @@ void otaHealthLoop() {
 // ---------------------------------------------------------------- main
 void setup() {
   Serial.begin(115200);
-  pinMode(PIN_BOOT, INPUT_PULLUP);
+  detectBoard();
+  buildMenu();
+  pinMode(board->boot, INPUT_PULLUP);
   loadConfig();
   for (int k = 0; k < MAX_NETS; k++) netRssi[k] = -999;
-  ledcAttach(PIN_BL, 5000, 8);
-  ledcWrite(PIN_BL, brightnessDuty());
-  SPI.begin(PIN_SCLK, -1, PIN_MOSI, PIN_CS);
-  tft.init(172, 320);
+  ledcAttach(board->bl, 5000, 8);
+  ledcWrite(board->bl, brightnessDuty());
+  SPI.begin(board->sclk, -1, board->mosi, board->cs);
+  display = new Adafruit_ST7789(board->cs, board->dc, board->rst);
+  tft.init(board->w, board->h);
   panelInit();
   touchBegin();
   setLed(T_NONE);

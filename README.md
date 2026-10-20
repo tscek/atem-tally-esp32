@@ -3,7 +3,11 @@
 Tally lučka za Blackmagic ATEM (preizkušeno z ATEM Mini Extreme) na plošči
 **Waveshare ESP32-C6-LCD-1.47** (zaslon ST7789 172×320, RGB LED WS2812) ali
 **Waveshare ESP32-C6-Touch-LCD-1.47** (zaslon JD9853, touch AXS5106L, brez vgrajene RGB LED; zunanji WS2812 lahko priklopiš na IO8)
-ali **Waveshare ESP32-S3-LCD-1.47B** (zaslon ST7789 172×320, RGB LED WS2812).
+ali **Waveshare ESP32-S3-LCD-1.47B** (zaslon ST7789 172×320, RGB LED WS2812)
+ali **Waveshare ESP32-C6-LCD-1.3** (kvadratni zaslon ST7789 240×240, RGB LED WS2812).
+En firmware za vse plošče z ESP32-C6 in en za ESP32-S3; plošča se prepozna ob zagonu.
+Plošči ESP32-C6-LCD-1.47 in 1.3 imata enake pine in se ju ne da ločiti, zato ploščo 1.3
+izbereš v meniju (Plosca) ali s serijskim ukazom `board ESP32-C6-LCD-1.3`.
 Lučka se z ATEM-om pogovarja neposredno po UDP protokolu (vrata 9910), brez računalnika.
 
 ## Funkcije
